@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rwkv-native"
+version = "0.1.0"
+description = "Production RWKV7 CUDA training and inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.12", "ninja"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["rwkv_native", "rwkv_native.*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+rwkv_native = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh", "third_party/**/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
