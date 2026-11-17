@@ -106,8 +106,8 @@ __device__ float row_sum(float value, float *scratch) {
     return result;
 }
 template <typename X, typename W>
-__global__ void ln_backward_rows(const X *x, const W *w, const W *g, X *dx, float *partial, int C,
-                                 float eps, const X *residual = nullptr, const W *direct = nullptr,
+__global__ void ln_backward_rows(const X *x, const W *w, const X *g, X *dx, float *partial, int C,
+                                 float eps, const X *residual = nullptr, const X *direct = nullptr,
                                  int tokens = 0, const int64_t *selected = nullptr) {
     const int row = blockIdx.x;
     if (tokens && selected)
@@ -167,8 +167,8 @@ std::vector<Tensor> layer_norm_backward(Tensor x, Tensor weight, Tensor grad, do
     check_float_tensor(grad);
     TORCH_CHECK(x.dim() >= 1 && x.size(-1) > 0 && weight.dim() == 1 && weight.numel() == x.size(-1),
                 "invalid LayerNorm shapes");
-    TORCH_CHECK(grad.sizes() == x.sizes() && grad.scalar_type() == weight.scalar_type(),
-                "gradient must match output/weight dtype");
+    TORCH_CHECK(grad.sizes() == x.sizes() && grad.scalar_type() == x.scalar_type(),
+                "gradient must match activation dtype");
     TORCH_CHECK(x.device() == weight.device() && x.device() == grad.device(), "device mismatch");
     TORCH_CHECK(eps > 0, "positive epsilon required");
     c10::cuda::CUDAGuard guard(x.device());
@@ -184,7 +184,7 @@ std::vector<Tensor> layer_norm_backward(Tensor x, Tensor weight, Tensor grad, do
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 at::kHalf, at::kBFloat16, weight.scalar_type(), "ln_backward_w", [&] {
                     ln_backward_rows<X, scalar_t><<<rows, 256, 0, stream>>>(
-                        x.data_ptr<X>(), weight.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                        x.data_ptr<X>(), weight.data_ptr<scalar_t>(), grad.data_ptr<X>(),
                         dx.data_ptr<X>(), partial.data_ptr<float>(), C, eps);
                     ln_backward_parameters<scalar_t><<<(C + 255) / 256, 256, 0, stream>>>(
                         partial.data_ptr<float>(), dw.data_ptr<scalar_t>(), db.data_ptr<scalar_t>(),
@@ -195,8 +195,8 @@ std::vector<Tensor> layer_norm_backward(Tensor x, Tensor weight, Tensor grad, do
     return {dx, dw, db};
 }
 
-template <typename T, typename P>
-__global__ void vres_backward_kernel(const T *v, const T *first, const T *bias, const P *logits,
+template <typename T, typename P, typename W>
+__global__ void vres_backward_kernel(const T *v, const T *first, const W *bias, const P *logits,
                                      const T *g, T *dv, T *df, P *dp, float *partial, int64_t n,
                                      int C) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -229,7 +229,7 @@ std::vector<Tensor> vres_backward(Tensor v, Tensor first, Tensor bias, Tensor lo
                     logits.sizes() == v.sizes() && grad.sizes() == v.sizes(),
                 "shape mismatch");
     TORCH_CHECK(bias.dim() == 1 && bias.numel() == v.size(-1), "invalid bias");
-    TORCH_CHECK(first.scalar_type() == v.scalar_type() && bias.scalar_type() == v.scalar_type() &&
+    TORCH_CHECK(first.scalar_type() == v.scalar_type() &&
                     grad.scalar_type() == v.scalar_type(),
                 "dtype mismatch");
     c10::cuda::CUDAGuard guard(v.device());
@@ -244,15 +244,20 @@ std::vector<Tensor> vres_backward(Tensor v, Tensor first, Tensor bias, Tensor lo
         at::kHalf, at::kBFloat16, v.scalar_type(), "vres_backward_v", [&] {
             using V = scalar_t;
             AT_DISPATCH_FLOATING_TYPES_AND2(
-                at::kHalf, at::kBFloat16, logits.scalar_type(), "vres_backward_p", [&] {
-                    vres_backward_kernel<V, scalar_t><<<(v.numel() + 255) / 256, 256, 0, stream>>>(
-                        v.data_ptr<V>(), first.data_ptr<V>(), bias.data_ptr<V>(),
-                        logits.data_ptr<scalar_t>(), grad.data_ptr<V>(), dv.data_ptr<V>(),
-                        df.data_ptr<V>(), dp.data_ptr<scalar_t>(), partial.data_ptr<float>(),
-                        v.numel(), C);
+                at::kHalf, at::kBFloat16, bias.scalar_type(), "vres_backward_w", [&] {
+                    using W = scalar_t;
+                    AT_DISPATCH_FLOATING_TYPES_AND2(
+                        at::kHalf, at::kBFloat16, logits.scalar_type(), "vres_backward_p", [&] {
+                            vres_backward_kernel<V, scalar_t, W>
+                                <<<(v.numel() + 255) / 256, 256, 0, stream>>>(
+                                    v.data_ptr<V>(), first.data_ptr<V>(), bias.data_ptr<W>(),
+                                    logits.data_ptr<scalar_t>(), grad.data_ptr<V>(), dv.data_ptr<V>(),
+                                    df.data_ptr<V>(), dp.data_ptr<scalar_t>(), partial.data_ptr<float>(),
+                                    v.numel(), C);
+                        });
+                    sum_columns_kernel<W><<<(C + 255) / 256, 256, 0, stream>>>(
+                        partial.data_ptr<float>(), db.data_ptr<W>(), v.numel() / C, C);
                 });
-            sum_columns_kernel<V><<<(C + 255) / 256, 256, 0, stream>>>(
-                partial.data_ptr<float>(), db.data_ptr<V>(), v.numel() / C, C);
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {dv, df, db, dp};
@@ -263,12 +268,14 @@ __device__ float warp_total(float v) {
         v += __shfl_down_sync(0xffffffff, v, d);
     return __shfl_sync(0xffffffff, v, 0);
 }
-template <typename T> struct ReadoutArgs {
+template <typename T, typename P> struct ReadoutArgs {
     const T *x[8];
     T *dx[8];
+    const P *p[8];
+    P *dp[8];
 };
-template <typename T>
-__global__ __launch_bounds__(32, 2) void readout_backward_rows(ReadoutArgs<T> a, const T *grad,
+template <typename T, typename P>
+__global__ __launch_bounds__(32, 2) void readout_backward_rows(ReadoutArgs<T, P> a, const T *grad,
                                                                float *partial, int C, int H) {
     const int group = blockIdx.x, row = group / H, head = group % H, lane = threadIdx.x;
     float x[2], r[2], k[2], v[2], scale[2], w[2], bias[2], gate[2], dy[2], hat[2], dn[2];
@@ -281,9 +288,9 @@ __global__ __launch_bounds__(32, 2) void readout_backward_rows(ReadoutArgs<T> a,
         r[j] = float(a.x[1][i]);
         k[j] = float(a.x[2][i]);
         v[j] = float(a.x[3][i]);
-        scale[j] = float(a.x[4][c]);
-        w[j] = float(a.x[5][c]);
-        bias[j] = float(a.x[6][c]);
+        scale[j] = float(a.p[4][c]);
+        w[j] = float(a.p[5][c]);
+        bias[j] = float(a.p[6][c]);
         gate[j] = float(a.x[7][i]);
         dy[j] = float(grad[i]);
         sum += x[j];
@@ -322,8 +329,8 @@ __global__ __launch_bounds__(32, 2) void readout_backward_rows(ReadoutArgs<T> a,
         partial[(int64_t(row) * 3 + 2) * C + c] = dn[j];
     }
 }
-template <typename T>
-__global__ void readout_backward_parameters(const float *p, ReadoutArgs<T> a, int rows, int C) {
+template <typename T, typename P>
+__global__ void readout_backward_parameters(const float *p, ReadoutArgs<T, P> a, int rows, int C) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C)
         return;
@@ -333,9 +340,9 @@ __global__ void readout_backward_parameters(const float *p, ReadoutArgs<T> a, in
         dw += p[(int64_t(row) * 3 + 1) * C + c];
         db += p[(int64_t(row) * 3 + 2) * C + c];
     }
-    a.dx[4][c] = T(ds);
-    a.dx[5][c] = T(dw);
-    a.dx[6][c] = T(db);
+    a.dp[4][c] = P(ds);
+    a.dp[5][c] = P(dw);
+    a.dp[6][c] = P(db);
 }
 std::vector<Tensor> readout_backward(std::vector<Tensor> xs, Tensor grad, int64_t H) {
     TORCH_CHECK(xs.size() == 8, "expected x,r,k,v,scale,weight,bias,gate");
@@ -346,12 +353,14 @@ std::vector<Tensor> readout_backward(std::vector<Tensor> xs, Tensor grad, int64_
     TORCH_CHECK(grad.device() == x.device() && grad.scalar_type() == x.scalar_type() &&
                     grad.sizes() == x.sizes(),
                 "invalid output gradient");
+    TORCH_CHECK(xs[4].scalar_type() == at::kFloat || xs[4].scalar_type() == at::kHalf ||
+                    xs[4].scalar_type() == at::kBFloat16, "unsupported parameter dtype");
     c10::cuda::CUDAGuard guard(x.device());
     std::vector<Tensor> dx;
     const int C = x.size(-1), rows = x.numel() / C;
     for (int i = 0; i < 8; ++i) {
         check_float_tensor(xs[i]);
-        TORCH_CHECK(xs[i].device() == x.device() && xs[i].scalar_type() == x.scalar_type(),
+        TORCH_CHECK(xs[i].device() == x.device() && xs[i].scalar_type() == ((i >= 4 && i <= 6) ? xs[4].scalar_type() : x.scalar_type()),
                     "input dtype/device mismatch");
         if (i >= 4 && i <= 6) {
             TORCH_CHECK(xs[i].dim() == 1 && xs[i].numel() == C, "invalid parameter shape");
@@ -369,15 +378,25 @@ std::vector<Tensor> readout_backward(std::vector<Tensor> xs, Tensor grad, int64_
     auto stream = c10::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf, at::kBFloat16, x.scalar_type(), "readout_backward", [&] {
-            ReadoutArgs<scalar_t> a{};
+            using X = scalar_t;
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xs[4].scalar_type(),
+                                           "readout_backward_parameters", [&] {
+            using P = scalar_t;
+            ReadoutArgs<X, P> a{};
             for (int i = 0; i < 8; ++i) {
-                a.x[i] = xs[i].data_ptr<scalar_t>();
-                a.dx[i] = dx[i].data_ptr<scalar_t>();
+                if (i == 4 || i == 5 || i == 6) {
+                    a.p[i] = xs[i].data_ptr<P>();
+                    a.dp[i] = dx[i].data_ptr<P>();
+                } else {
+                    a.x[i] = xs[i].data_ptr<X>();
+                    a.dx[i] = dx[i].data_ptr<X>();
+                }
             }
-            readout_backward_rows<scalar_t><<<rows * H, 32, 0, stream>>>(
-                a, grad.data_ptr<scalar_t>(), partial.data_ptr<float>(), C, H);
-            readout_backward_parameters<scalar_t>
+            readout_backward_rows<X, P><<<rows * H, 32, 0, stream>>>(
+                a, grad.data_ptr<X>(), partial.data_ptr<float>(), C, H);
+            readout_backward_parameters<X, P>
                 <<<(C + 255) / 256, 256, 0, stream>>>(partial.data_ptr<float>(), a, rows, C);
+            });
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dx;

@@ -75,7 +75,10 @@ def prepare_lt(w, equivalent=True):
     key = (_weight_signature(w), equivalent)
     if key in _validated_lt_plans:
         return True, "validated cuBLASLt configuration"
-    if w.dtype != torch.float16 or torch.cuda.get_device_capability(w.device) != (12, 0):
+    capability = torch.cuda.get_device_capability(w.device)
+    if capability == (8, 9) and w.dtype in (torch.float16, torch.bfloat16):
+        return _prepare_sm89_lt(w, equivalent)
+    if w.dtype != torch.float16 or capability != (12, 0):
         return False, "no validated cuBLASLt configuration for this architecture/dtype"
     shape = f"{w.shape[0]},{w.shape[1]}"
     selected = selections().get(shape)
@@ -104,6 +107,31 @@ def prepare_lt(w, equivalent=True):
         chosen.append(plan)
     _validated_lt_plans[key] = (chosen[0], chosen[1], alternate["max_rows"] if alternate else 0)
     return True, "validated cuBLASLt configuration"
+
+
+def _prepare_sm89_lt(w, equivalent):
+    # Fixed algorithm across every row count, not shape-dependent heuristic
+    # selection at execution time. Ordered split reduction is used for low rank.
+    shape = tuple(w.shape)
+    if shape not in ((2560,2560),(2560,10240),(2560,96)) or tuple(w.stride()) != (1,2560):
+        return False, "shape/layout uses the fixed CUDA fallback"
+    if _is_capturing(w.device):
+        raise RuntimeError("Prepare the model before CUDA graph capture")
+    splits, reduction = (8,2) if shape[1] == 96 else (1,0)
+    canonical = torch.empty((256,shape[0]),device=w.device,dtype=w.dtype)
+    candidates = extension("lt").candidates(canonical,w,32*1024**2,64)
+    for seed in candidates:
+        if seed.info()["id"] != 21:
+            continue
+        try:
+            plan = seed.configure(splits,reduction,15,12)
+            for rows in (1,17,64,65,192,320,768,4096):
+                plan.retarget(canonical.new_empty(rows,shape[0]),w)
+        except RuntimeError:
+            continue
+        _validated_lt_plans[(_weight_signature(w),equivalent)] = (plan,None,0)
+        return True, "validated fixed SM89 cuBLASLt algorithm"
+    return False, "fixed SM89 cuBLASLt algorithm unavailable; using fixed CUDA"
 
 
 def _lt_plan(x, w, equivalent):
@@ -136,6 +164,10 @@ def _fixed_schedule(k, n, rows):
     while k % splits or (k // splits) % 32:
         splits //= 2
     tile = 32 if k <= 512 or n <= 512 else 64 if k == n or rows <= 64 else 128
+    # Same MMA K order and split reduction, with fewer inactive M rows for
+    # decode. K64 / three-stage cp.async also improves uncached weight reads.
+    if rows <= 16 and k >= 1024 and n >= 1024 and (k // splits) % 64 == 0:
+        tile = 16
     return splits, tile
 
 
@@ -182,10 +214,12 @@ def project_rows(x: torch.Tensor, w: torch.Tensor, backend: str) -> torch.Tensor
         or not x.is_cuda
     ):
         raise ValueError("expected matching CUDA FP16/BF16 operands")
-    if backend not in ("fixed", "lt", "lt_equivalent", "pre_group"):
+    if backend not in ("fixed", "lt", "lt_equivalent", "pre_group", "torch"):
         raise ValueError("invalid projection backend")
     if not x.shape[0]:
         return x.new_empty((0, w.shape[1]), dtype=torch.float32)
+    if backend == "torch":
+        return torch.mm(x, w, out_dtype=torch.float32)
     x = x.contiguous()
     if x.data_ptr() % 16:
         x = x.clone()
@@ -202,12 +236,22 @@ def project_rows(x: torch.Tensor, w: torch.Tensor, backend: str) -> torch.Tensor
             wp = F.pad(wp, (0, kp - k, 0, np - n))
         if wp.data_ptr() % 16:
             wp = wp.clone()
-        outputs = []
-        run = extension("fixed").run
-        for part in xp.split(768):
+        output = x.new_empty((x.shape[0],np),dtype=torch.float32)
+        run = extension("fixed").run_out
+        # Narrow low-rank projections benefit from fewer launches and concat
+        # copies. Keep the wider split-K intermediates bounded: larger blocks
+        # regress square projections and the 4096 -> 480 gate on SM89.
+        block = 3072 if kp <= 512 or np <= 384 else 768
+        # These shapes already retain split-K sums in registers. A single
+        # prefill grid reuses weights across M tiles without split scratch.
+        if 768 <= xp.shape[0] <= 4096 and (kp, np) in ((4096,4096),(4096,16384),(16384,4096)):
+            block = xp.shape[0]
+        offset = 0
+        for part in xp.split(block):
             splits, tile = _fixed_schedule(kp, np, part.shape[0])
-            outputs.append(run(part, wp, splits, tile)[:, :n])
-        return outputs[0].contiguous() if len(outputs) == 1 else torch.cat(outputs, 0)
+            run(part, wp, splits, tile, output[offset:offset+part.shape[0]])
+            offset += part.shape[0]
+        return output[:, :n].contiguous()
     if w.data_ptr() % 16:
         raise ValueError("unaligned weights require the fixed CUDA backend")
     equivalent = backend == "lt_equivalent"
@@ -215,6 +259,9 @@ def project_rows(x: torch.Tensor, w: torch.Tensor, backend: str) -> torch.Tensor
         supported, reason = prepare_lt(w, equivalent)
         if not supported:
             raise RuntimeError(reason)
+    if (x.shape[0] >= 1024 and tuple(w.shape) in ((2560,2560),(2560,10240))
+            and w.T.is_contiguous() and torch.cuda.get_device_capability(w.device) == (8,9)):
+        return extension("flash_linear").run(x,w.T,128,False)
     # Same sequential SM80 MMA arithmetic as the validated unsplit FFN key
     # plan. Its single-row schedule avoids the canonical large-row CTA tile.
     if x.shape[0] == 1 and tuple(w.shape) == (2048, 8192):
@@ -226,17 +273,20 @@ def project_rows(x: torch.Tensor, w: torch.Tensor, backend: str) -> torch.Tensor
 
 class _LinearProjection(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w, relu_squared, adjoint_mode, backend):
-        flat = x.float().reshape(-1, x.shape[-1]).contiguous()
+    def forward(ctx, x, w, activation, adjoint_mode, backend):
+        # Preserve FP32 ReLU² arithmetic, but never widen an already-packed
+        # projection operand only to narrow it back to the same dtype.
+        value = x.float() if activation or x.dtype not in (torch.float32,torch.float16,torch.bfloat16) else x
+        flat = value.reshape(-1, x.shape[-1]).contiguous()
         operand = (
-            extension("ops").relu_pack(flat, w.dtype == torch.bfloat16)
-            if relu_squared
+            extension("ops").activation_pack(flat, w.dtype == torch.bfloat16, activation)
+            if activation
             else flat.to(w.dtype)
         )
-        ctx.save_for_backward(operand, w, flat if relu_squared else flat.new_empty(0))
+        ctx.save_for_backward(operand, w, flat if activation else flat.new_empty(0))
         ctx.shape = x.shape
         ctx.dtype = x.dtype
-        ctx.relu_squared = relu_squared
+        ctx.activation = activation
         ctx.adjoint_mode = adjoint_mode
         return project_rows(operand, w, backend).view(*x.shape[:-1], w.shape[1])
 
@@ -254,11 +304,29 @@ class _LinearProjection(torch.autograd.Function):
             need_dw=ctx.needs_input_grad[1],
         )
         if dx is not None:
-            if ctx.relu_squared:
-                dx = activation_backward(preactivation, dx, RELU_SQUARED)
+            if ctx.activation:
+                dx = activation_backward(preactivation, dx, ctx.activation)
             dx = dx.view(ctx.shape).to(ctx.dtype)
         return dx, dw.to(w.dtype) if dw is not None else None, None, None, None
 
 
-def matmul(x, w, *, relu_squared=False, adjoint_mode="store", backend="fixed"):
-    return _LinearProjection.apply(x, w, relu_squared, adjoint_mode, backend)
+def matmul(x, w, *, relu_squared=False, activation=0, adjoint_mode="store", backend="fixed"):
+    if activation not in (0,2,3) or (relu_squared and activation):
+        raise ValueError("choose at most one of ReLU², tanh or sigmoid")
+    return _LinearProjection.apply(x, w, RELU_SQUARED if relu_squared else activation, adjoint_mode, backend)
+
+
+def can_pack_ffn_key(rows, weight, backend):
+    """Inference FFN epilogue; strict retains the validated training arithmetic."""
+    if (rows == 1 and backend in ('fixed','lt','lt_equivalent')
+            and tuple(weight.shape) in ((2560,10240),(4096,16384))
+            and weight.T.is_contiguous() and weight.data_ptr()%16 == 0):
+        return True
+    if backend == "torch":
+        return (rows >= 2048 and tuple(weight.shape) in ((2560,10240),(4096,16384))
+                and not (weight.dtype == torch.bfloat16 and weight.shape[0] == 4096)
+                and weight.T.is_contiguous() and weight.data_ptr() % 16 == 0
+                and torch.cuda.get_device_capability(weight.device)[0] >= 8)
+    return (rows >= 1024 and backend in ("lt","lt_equivalent")
+            and tuple(weight.shape) == (2560,10240) and weight.T.is_contiguous()
+            and torch.cuda.get_device_capability(weight.device) == (8,9))

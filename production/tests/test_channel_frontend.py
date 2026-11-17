@@ -9,9 +9,9 @@ from rwkv_native.ops.normalization import layer_norm
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("batch,tokens", [(1, 1), (4, 1), (1, 7), (4, 7), (48, 7)])
-def test_channel_frontend_composition_and_adjoints(dtype, batch, tokens):
+def test_channel_frontend_composition_and_adjoints(dtype, batch, tokens, width=64):
     torch.manual_seed(904)
-    c = 64
+    c = width
     x = torch.randn(batch, tokens, c, device="cuda") * 0.1
     mixed = torch.randn_like(x) * 0.1
     output_weight = (torch.randn(c, c, device="cuda", dtype=dtype) * 0.01).T
@@ -51,3 +51,10 @@ def test_channel_frontend_composition_and_adjoints(dtype, batch, tokens):
     gb = torch.autograd.grad(actual, fused, grads)
     for a, b in zip(ga, gb):
         torch.testing.assert_close(a, b, atol=2e-5, rtol=0.02 if dtype == torch.bfloat16 else 0.003)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("width", [2560, 4096])
+@pytest.mark.parametrize("batch,tokens", [(3, 1), (1, 17)])
+def test_wide_fixed_channel_frontend(dtype, width, batch, tokens):
+    test_channel_frontend_composition_and_adjoints(dtype, batch, tokens, width)

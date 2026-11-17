@@ -6,14 +6,14 @@
 #include <c10/cuda/CUDAException.h>
 #include <vector>
 using at::Tensor;
-template <typename T> struct MixArgs {
-    const T *c[6];
+template <typename T, typename P> struct MixArgs {
+    const P *c[6];
     const T *g[6];
-    T *dc[6];
+    P *dc[6];
     int count;
 };
-template <typename T>
-__global__ void mix_backward_inputs(MixArgs<T> a, T *dx, T *ds, const T *final_grad, int B, int Tn,
+template <typename T, typename P>
+__global__ void mix_backward_inputs(MixArgs<T, P> a, T *dx, T *ds, const T *final_grad, int B, int Tn,
                                     int C) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= int64_t(B) * Tn * C)
@@ -36,8 +36,8 @@ __global__ void mix_backward_inputs(MixArgs<T> a, T *dx, T *ds, const T *final_g
     if (t == 0)
         ds[int64_t(b) * C + c] = T(prev);
 }
-template <typename T>
-__global__ void mix_backward_coefficients(MixArgs<T> a, const T *x, const T *state, float *partial,
+template <typename T, typename P>
+__global__ void mix_backward_coefficients(MixArgs<T, P> a, const T *x, const T *state, float *partial,
                                           int rows, int Tn, int C, int chunks) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, chunk = blockIdx.y, group = blockIdx.z;
     if (c >= C)
@@ -53,15 +53,15 @@ __global__ void mix_backward_coefficients(MixArgs<T> a, const T *x, const T *sta
         }
     partial[(int64_t(group) * chunks + chunk) * C + c] = total;
 }
-template <typename T>
-__global__ void mix_backward_reduce(MixArgs<T> a, const float *partial, int C, int chunks) {
+template <typename T, typename P>
+__global__ void mix_backward_reduce(MixArgs<T, P> a, const float *partial, int C, int chunks) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, g = blockIdx.y;
     if (c >= C)
         return;
     float total = 0.f;
     for (int chunk = 0; chunk < chunks; ++chunk)
         total += partial[(int64_t(g) * chunks + chunk) * C + c];
-    a.dc[g][c] = T(total);
+    a.dc[g][c] = P(total);
 }
 std::vector<Tensor> mix_backward(Tensor x, Tensor state, std::vector<Tensor> coeff,
                                  std::vector<Tensor> grad, Tensor final_grad) {
@@ -72,6 +72,8 @@ std::vector<Tensor> mix_backward(Tensor x, Tensor state, std::vector<Tensor> coe
                 "unsupported input dtype");
     TORCH_CHECK(coeff.size() >= 1 && coeff.size() <= 6 && grad.size() == coeff.size(),
                 "expected 1..6 coefficient/gradient pairs");
+    TORCH_CHECK(coeff[0].scalar_type() == at::kFloat || coeff[0].scalar_type() == at::kHalf ||
+                    coeff[0].scalar_type() == at::kBFloat16, "unsupported coefficient dtype");
     c10::cuda::CUDAGuard guard(x.device());
     const int B = x.size(0), Tn = x.size(1), C = x.size(2), rows = B * Tn,
               chunks = (rows + 127) / 128;
@@ -87,7 +89,9 @@ std::vector<Tensor> mix_backward(Tensor x, Tensor state, std::vector<Tensor> coe
                 "invalid final-state gradient");
     std::vector<Tensor> result = {at::empty_like(x), at::empty_like(state)};
     for (size_t i = 0; i < coeff.size(); ++i) {
-        check(coeff[i]);
+        TORCH_CHECK(coeff[i].device() == x.device() && coeff[i].is_contiguous() &&
+                        coeff[i].scalar_type() == coeff[0].scalar_type(),
+                    "coefficient dtype/device/layout mismatch");
         check(grad[i]);
         TORCH_CHECK(coeff[i].dim() == 1 && coeff[i].numel() == C, "invalid coefficient shape");
         TORCH_CHECK(grad[i].numel() == 0 || grad[i].sizes() == x.sizes(), "invalid mixed gradient");
@@ -101,22 +105,27 @@ std::vector<Tensor> mix_backward(Tensor x, Tensor state, std::vector<Tensor> coe
     auto partial = at::empty({int64_t(coeff.size()), chunks, C}, x.options().dtype(at::kFloat));
     auto stream = c10::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "mix_backward", [&] {
-        MixArgs<scalar_t> a{};
+        using X = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, coeff[0].scalar_type(),
+                                       "mix_backward_parameters", [&] {
+        using P = scalar_t;
+        MixArgs<X, P> a{};
         a.count = coeff.size();
         for (size_t i = 0; i < coeff.size(); ++i) {
             a.c[i] = coeff[i].data_ptr<scalar_t>();
-            a.g[i] = grad[i].numel() ? grad[i].data_ptr<scalar_t>() : nullptr;
+            a.g[i] = grad[i].numel() ? grad[i].data_ptr<X>() : nullptr;
             a.dc[i] = result[i + 2].data_ptr<scalar_t>();
         }
-        mix_backward_inputs<scalar_t><<<(x.numel() + 255) / 256, 256, 0, stream>>>(
-            a, result[0].data_ptr<scalar_t>(), result[1].data_ptr<scalar_t>(),
-            final_grad.numel() ? final_grad.data_ptr<scalar_t>() : nullptr, B, Tn, C);
-        mix_backward_coefficients<scalar_t>
+        mix_backward_inputs<X, P><<<(x.numel() + 255) / 256, 256, 0, stream>>>(
+            a, result[0].data_ptr<X>(), result[1].data_ptr<X>(),
+            final_grad.numel() ? final_grad.data_ptr<X>() : nullptr, B, Tn, C);
+        mix_backward_coefficients<X, P>
             <<<dim3((C + 255) / 256, chunks, coeff.size()), 256, 0, stream>>>(
-                a, x.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(), partial.data_ptr<float>(),
+                a, x.data_ptr<X>(), state.data_ptr<X>(), partial.data_ptr<float>(),
                 rows, Tn, C, chunks);
-        mix_backward_reduce<scalar_t><<<dim3((C + 255) / 256, coeff.size()), 256, 0, stream>>>(
+        mix_backward_reduce<X, P><<<dim3((C + 255) / 256, coeff.size()), 256, 0, stream>>>(
             a, partial.data_ptr<float>(), C, chunks);
+        });
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return result;

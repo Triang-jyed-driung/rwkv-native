@@ -10,13 +10,15 @@ __device__ float key_sum(float v) {
         v += __shfl_down_sync(0xffffffff, v, d);
     return __shfl_sync(0xffffffff, v, 0);
 }
-template <typename T> struct KeyArgs {
+template <typename T, typename P> struct KeyArgs {
     const T *x[5];
     const T *g[3];
     T *dx[5];
+    const P *p[5];
+    P *dp[5];
 };
-template <typename T>
-__global__ __launch_bounds__(32, 2) void key_backward_rows(KeyArgs<T> a, float *partial, int C,
+template <typename T, typename P>
+__global__ __launch_bounds__(32, 2) void key_backward_rows(KeyArgs<T, P> a, float *partial, int C,
                                                            int H) {
     const int row = blockIdx.x / H, head = blockIdx.x % H, lane = threadIdx.x;
     float k[2], scale[2], u[2], q[2], rate[2], ka[2], gk[2], ga[2], gb[2], gq[2];
@@ -26,10 +28,10 @@ __global__ __launch_bounds__(32, 2) void key_backward_rows(KeyArgs<T> a, float *
         const int c = head * 64 + lane + j * 32;
         const int64_t i = int64_t(row) * C + c;
         k[j] = float(a.x[0][i]);
-        scale[j] = float(a.x[1][c]);
-        ka[j] = float(a.x[4][c]);
+        scale[j] = float(a.p[1][c]);
+        ka[j] = float(a.p[4][c]);
         u[j] = k[j] * scale[j];
-        rate[j] = 1.f / (1.f + expf(-(float(a.x[2][c]) + float(a.x[3][i]))));
+        rate[j] = 1.f / (1.f + expf(-(float(a.p[2][c]) + float(a.x[3][i]))));
         gk[j] = a.g[0] ? float(a.g[0][i]) : 0.f;
         ga[j] = a.g[1] ? float(a.g[1][i]) : 0.f;
         gb[j] = a.g[2] ? float(a.g[2][i]) : 0.f;
@@ -56,8 +58,8 @@ __global__ __launch_bounds__(32, 2) void key_backward_rows(KeyArgs<T> a, float *
         partial[(int64_t(row) * 3 + 2) * C + c] = gk[j] * k[j] * (rate[j] - 1.f);
     }
 }
-template <typename T>
-__global__ void key_backward_parameters(KeyArgs<T> a, const float *p, int rows, int C) {
+template <typename T, typename P>
+__global__ void key_backward_parameters(KeyArgs<T, P> a, const float *p, int rows, int C) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C)
         return;
@@ -67,9 +69,9 @@ __global__ void key_backward_parameters(KeyArgs<T> a, const float *p, int rows, 
         da += p[(int64_t(row) * 3 + 1) * C + c];
         dk += p[(int64_t(row) * 3 + 2) * C + c];
     }
-    a.dx[1][c] = T(ds);
-    a.dx[2][c] = T(da);
-    a.dx[4][c] = T(dk);
+    a.dp[1][c] = P(ds);
+    a.dp[2][c] = P(da);
+    a.dp[4][c] = P(dk);
 }
 std::vector<Tensor> key_gate_backward(std::vector<Tensor> xs, std::vector<Tensor> grads,
                                       int64_t H) {
@@ -85,10 +87,14 @@ std::vector<Tensor> key_gate_backward(std::vector<Tensor> xs, std::vector<Tensor
                         t.scalar_type() == x.scalar_type(),
                     "dtype/device/layout mismatch");
     };
+    TORCH_CHECK(xs[1].scalar_type() == at::kFloat || xs[1].scalar_type() == at::kHalf ||
+                    xs[1].scalar_type() == at::kBFloat16, "unsupported parameter dtype");
     c10::cuda::CUDAGuard guard(x.device());
     std::vector<Tensor> dx;
     for (int i = 0; i < 5; ++i) {
-        check(xs[i]);
+        TORCH_CHECK(xs[i].is_contiguous() && xs[i].device() == x.device() &&
+                        xs[i].scalar_type() == ((i == 0 || i == 3) ? x.scalar_type() : xs[1].scalar_type()),
+                    "input dtype/device/layout mismatch");
         if (i == 0 || i == 3) {
             TORCH_CHECK(xs[i].sizes() == x.sizes(), "activation shape mismatch");
         } else {
@@ -109,17 +115,27 @@ std::vector<Tensor> key_gate_backward(std::vector<Tensor> xs, std::vector<Tensor
     auto stream = c10::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf, at::kBFloat16, x.scalar_type(), "key_gate_backward", [&] {
-            KeyArgs<scalar_t> a{};
+            using X = scalar_t;
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xs[1].scalar_type(),
+                                           "key_gate_backward_parameters", [&] {
+            using P = scalar_t;
+            KeyArgs<X, P> a{};
             for (int i = 0; i < 5; ++i) {
-                a.x[i] = xs[i].data_ptr<scalar_t>();
-                a.dx[i] = dx[i].data_ptr<scalar_t>();
+                if (i == 1 || i == 2 || i == 4) {
+                    a.p[i] = xs[i].data_ptr<P>();
+                    a.dp[i] = dx[i].data_ptr<P>();
+                } else {
+                    a.x[i] = xs[i].data_ptr<X>();
+                    a.dx[i] = dx[i].data_ptr<X>();
+                }
             }
             for (int i = 0; i < 3; ++i)
-                a.g[i] = grads[i].numel() ? grads[i].data_ptr<scalar_t>() : nullptr;
-            key_backward_rows<scalar_t>
+                a.g[i] = grads[i].numel() ? grads[i].data_ptr<X>() : nullptr;
+            key_backward_rows<X, P>
                 <<<rows * H, 32, 0, stream>>>(a, partial.data_ptr<float>(), C, H);
-            key_backward_parameters<scalar_t>
+            key_backward_parameters<X, P>
                 <<<(C + 255) / 256, 256, 0, stream>>>(a, partial.data_ptr<float>(), rows, C);
+            });
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dx;

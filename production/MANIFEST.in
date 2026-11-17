@@ -1,0 +1,28 @@
+include README.md PERFORMANCE.md pyproject.toml
+recursive-include rwkv_native *.py
+recursive-include rwkv_native/csrc *.cpp *.cu *.cuh
+graft rwkv_native/third_party
+prune tests
+prune tools
+include tests/conftest.py
+include tests/wkv_reference.py
+include tests/test_runtime_config.py
+include tests/test_strict_forward_contract.py
+include tests/test_masked_backward.py
+include tests/test_checkpoint.py
+include tests/test_large_checkpoint.py
+include tests/test_wkv.py
+include tests/test_head_loss.py
+include tests/test_inference_fp64_reference.py
+include tests/test_training_fp64_reference.py
+include tests/test_training_benchmark_loss.py
+include tools/benchmark_common.py
+include tools/benchmark_model.py
+include tools/inference_fp64_check.py
+include tools/training_fp64_check.py
+include tools/inference_forward_invariance.py
+include tools/training_forward_invariance.py
+include tools/staged_inference_model.py
+include tools/flash_model.py
+include tools/FlashRWKV2.LICENSE
+global-exclude *.rst *.py[cod] *.so *.o *.pt *.pth *.ckpt *.safetensors

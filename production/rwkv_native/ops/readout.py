@@ -18,12 +18,18 @@ class _Readout(torch.autograd.Function):
     def backward(ctx, grad):
         inputs = ctx.saved_tensors
         gradients = extension("core").readout_backward(
-            [value.float() for value in inputs], grad.contiguous(), ctx.heads
+            list(inputs), grad.contiguous(), ctx.heads
         )
-        return None, *[grad.to(value.dtype) for grad, value in zip(gradients, inputs)]
+        return None, *gradients
 
 
-def readout(x, r, k, v, scale, weight, bias, gate, heads):
+def readout(x, r, k, v, scale, weight, bias, gate, heads, *, packed=False):
     # Parameters are converted in registers inside the CUDA forward.
     xs = [t.contiguous() for t in (x, r, k, v, scale.flatten(), weight, bias, gate)]
+    if packed:
+        if torch.is_grad_enabled():
+            raise ValueError("packed readout requires gradients to be disabled")
+        # Preserve FP32 normalization and gating, then store the exact operand
+        # needed by the next projection without an intermediate FP32 buffer.
+        return extension("core").readout_packed_forward(xs, heads)
     return _Readout.apply(heads, *xs)

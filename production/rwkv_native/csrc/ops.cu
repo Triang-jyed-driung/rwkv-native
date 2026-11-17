@@ -66,6 +66,30 @@ Tensor fixed_relu_pack(Tensor x, bool bf16) {
     }
     return out;
 }
+template <typename P>
+__global__ void activation_pack(const float *x,P *out,int64_t count,int kind) {
+    int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count) {
+        float v=x[i];
+        if(kind==2)v=tanhf(v);
+        else v=1.f/(1.f+expf(-v));
+        out[i]=P(v);
+    }
+}
+Tensor fixed_activation_pack(Tensor x,bool bf16,int64_t kind) {
+    if(kind==1)return fixed_relu_pack(x,bf16);
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type()==at::kFloat &&
+                (kind==2 || kind==3),"expected contiguous FP32 input and tanh/sigmoid activation");
+    c10::cuda::CUDAGuard guard(x.device());
+    auto out=at::empty_like(x,x.options().dtype(bf16?at::kBFloat16:at::kHalf));
+    if(x.numel()) {
+        auto stream=c10::cuda::getCurrentCUDAStream();
+        if(bf16)activation_pack<<<(x.numel()+255)/256,256,0,stream>>>(x.data_ptr<float>(),out.data_ptr<at::BFloat16>(),x.numel(),kind);
+        else activation_pack<<<(x.numel()+255)/256,256,0,stream>>>(x.data_ptr<float>(),out.data_ptr<at::Half>(),x.numel(),kind);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
+}
 __device__ float norm_sum(float value, float *scratch) {
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int d = 16; d; d >>= 1)

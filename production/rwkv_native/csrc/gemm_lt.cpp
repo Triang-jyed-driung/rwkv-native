@@ -107,6 +107,24 @@ struct Plan {
                     "retarget workspace exceeds 256 MiB");
         return std::make_shared<Plan>(next, checked);
     }
+    std::shared_ptr<Plan> configure(int splits, int reduction, int tile, int stages) {
+        const auto &l = *layout;
+        c10::cuda::CUDAGuard guard(l.device);
+        auto algo = algorithm;
+        for (auto item : std::vector<std::pair<cublasLtMatmulAlgoConfigAttributes_t, int>>{
+                 {CUBLASLT_ALGO_CONFIG_SPLITK_NUM, splits},
+                 {CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, reduction},
+                 {CUBLASLT_ALGO_CONFIG_TILE_ID, tile},
+                 {CUBLASLT_ALGO_CONFIG_STAGES_ID, stages}})
+            check(cublasLtMatmulAlgoConfigSetAttribute(&algo, item.first, &item.second, sizeof(int)));
+        cublasLtMatmulHeuristicResult_t checked{};
+        check(cublasLtMatmulAlgoCheck(at::cuda::getCurrentCUDABlasLtHandle(), l.op, l.a, l.b,
+                                      l.c, l.c, &algo, &checked));
+        check(checked.state);
+        TORCH_CHECK(checked.workspaceSize <= 32 * 1024 * 1024, "configured workspace exceeds 32 MiB");
+        checked.algo = algo;
+        return std::make_shared<Plan>(layout, checked);
+    }
     std::map<std::string, int64_t> info() {
         std::map<std::string, int64_t> result{{"workspace_bytes", int64_t(workspace)}};
         for (auto item : std::vector<std::pair<std::string, cublasLtMatmulAlgoConfigAttributes_t>>{
@@ -150,6 +168,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<Plan, std::shared_ptr<Plan>>(m, "Plan")
         .def("run", &Plan::run)
         .def("info", &Plan::info)
+        .def("configure", &Plan::configure)
         .def("retarget", &Plan::retarget);
     m.def("candidates", &candidates);
 }

@@ -21,5 +21,22 @@ Attention mixing and grouped input-projection scheduling follow Albatross's
 rkv_lowrank_pre_executor_kernel. See ALBATROSS_LICENSE and
 references/Albatross-Apache-2.0.txt.
 
+The sparse FFN down projection in csrc/sparse_ffn.cu adapts Albatross
+faster3a_2607/cuda/rwkv7_fast_ops_fp16.cu, commit
+545dd1870ea6cf424d7f7d4da16b7f87491405db. It retains the ballot/prefix compaction
+and coalesced nonzero-feature reads, and changes activation input, operand types,
+accumulation, output reduction, and tail handling. See ALBATROSS_LICENSE.
+
 Original export paths and per-file hashes are preserved with the archived
 implementation in research/legacy.zip at the project root.
+
+The standalone CUDA projection in csrc/flash_linear.cu translates the SM80
+copy pipeline, MMA ordering and FullCol warp placement of FlashRWKV2
+flashrwkv2/_internal/linear.py (commit 311d3c0ebf1ebcf5a62853c45c43b8ead3fa1c37).
+It supports FP16/BF16 operands and an optional fused ReLU-squared packing
+epilogue. It has no TileLang runtime dependency. See LICENSE.FlashRWKV2.
+
+The float-input staging kernel in csrc/wkv_prefetch.cuh adapts multi-token
+prefetch from FlashRWKV2 flashrwkv2/tmix/wkv7/tilelang.py (same commit above).
+It retains rwkv-native's balanced pair-product reduction tree, FP32 decay,
+state update order, arbitrary masks, and configurable checkpoint spacing.

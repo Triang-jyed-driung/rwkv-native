@@ -10,9 +10,27 @@ class Extension:
     sources: tuple[str, ...]
     includes: tuple[str, ...] = ()
     libraries: tuple[str, ...] = ()
+    cuda_flags: tuple[str, ...] = ()
 
 
 EXTENSIONS = {
+    "wkv_cooperative_inference": Extension(("wkv_cooperative_inference.cu",)),
+    "head_gradient_pack": Extension(("head_gradient_pack.cu",)),
+    "scaled_half": Extension(("scaled_half_pack.cu",), libraries=("cublas",)),
+    "wkv_simt_backward": Extension(("wkv_simt_backward.cu",)),
+    "wkv_cooperative": Extension(("wkv_cooperative.cu",)),
+    "wkv_mma_backward": Extension(("wkv_mma_backward.cu",), cuda_flags=("--use_fast_math", "--maxrregcount=240")),
+    "decode_inputs": Extension(("decode_inputs.cu",)),
+    "decode_inputs_wide": Extension(("decode_inputs_wide.cu",)),
+    "decode_rank": Extension(("decode_rank.cu",)),
+    "decode_up": Extension(("decode_up.cu",)),
+    "frontend_prefill": Extension(("frontend_prefill.cu",)),
+    "ffn_down": Extension(("ffn_down.cu",), ("third_party/cutlass/include",)),
+    "wkv_inference": Extension(("wkv_inference.cpp", "wkv_inference_prefetch.cu", "wkv_inference_register.cu")),
+    "head_ce": Extension(("head_ce.cu",)),
+    "flash_linear": Extension(("flash_linear.cu",)),
+    "embedding": Extension(("embedding.cu",)),
+    "sparse_ffn": Extension(("sparse_ffn.cu",)),
     "core": Extension(
         (
             "binding.cpp",
@@ -49,6 +67,6 @@ def extension(kind):
         extra_include_paths=[str(root / path) for path in spec.includes],
         extra_ldflags=["-l" + name for name in spec.libraries],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-lineinfo"],
+        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-lineinfo", *spec.cuda_flags],
         with_cuda=True,
     )

@@ -5,6 +5,39 @@ from wkv_reference import wkv7_reference
 from rwkv_native import wkv7
 
 
+@pytest.mark.parametrize("batch,heads", [(1, 40), (1, 64), (2, 40)])
+@pytest.mark.parametrize("length", [255, 256, 257, 513])
+def test_register_prefetch_matches_training_and_chunked_forward(batch, heads, length):
+    from rwkv_native._extensions import extension
+
+    xs, state, mask = inputs(torch.float32, length, B=batch, H=heads)
+    # Keep valid tokens in the one-sequence cases, including an incomplete
+    # prefetch group. Masked NaNs must not contaminate live state or outputs.
+    mask[0] = torch.arange(length, device="cuda") % 7 != 0
+    for x in xs:
+        x[~mask] = float("nan")
+    original_state = state.clone()
+    core = extension("core")
+    training, training_state, _ = core.forward(*xs, state, mask, 16, True)
+    inference, inference_state, _ = core.forward(*xs, state, mask, 16, False)
+    assert torch.equal(training, inference)
+    assert torch.equal(training_state, inference_state)
+    with torch.no_grad():
+        split, current = [], state
+        for start in range(0, length, 127):
+            stop = min(start + 127, length)
+            y, current = wkv7(*(x[:, start:stop] for x in xs), current, mask[:, start:stop])
+            split.append(y)
+        assert torch.equal(torch.cat(split, dim=1), inference)
+        assert torch.equal(current, inference_state)
+        for sample in range(batch):
+            y, final = wkv7(*(x[sample:sample + 1] for x in xs),
+                            state[sample:sample + 1], mask[sample:sample + 1])
+            assert torch.equal(y, inference[sample:sample + 1])
+            assert torch.equal(final, inference_state[sample:sample + 1])
+    assert torch.equal(state, original_state)
+
+
 def inputs(dtype, T, B=2, H=2):
     torch.manual_seed(1234)
     shape = (B, T, H, 64)
@@ -122,6 +155,24 @@ def test_large_batch_dispatch_backward_and_decode(dtype, batch, length):
         torch.testing.assert_close(current, s, atol=2e-6, rtol=2e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_head_batch_dispatch_is_bitwise_invariant(dtype):
+    # B*H=64 uses warp rows; duplicating the batch crosses into shared tiles.
+    xs, state, mask = inputs(dtype, 65, B=1, H=64)
+    mask[:] = True
+    mask[:, 4::7] = False
+    for x in xs:
+        x[~mask] = float("nan")
+        x.requires_grad_()
+    y, final = wkv7(*xs, state, mask)
+    with torch.no_grad():
+        batched, states = wkv7(*(x.repeat(2, 1, 1, 1) for x in xs),
+                              state.repeat(2, 1, 1, 1), mask.repeat(2, 1))
+    for i in range(2):
+        torch.testing.assert_close(batched[i:i+1], y, atol=0, rtol=0)
+        torch.testing.assert_close(states[i:i+1], final, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("checkpoint_size", [1, 7, 64, 256])
 def test_checkpoint_size_preserves_fp32_gradients(checkpoint_size):
     xs, state, mask = inputs(torch.float32, 65)
@@ -180,3 +231,25 @@ def test_unused_final_state_adjoint(batch, tokens):
         torch.testing.assert_close(a, e, atol=0, rtol=0)
     assert torch.count_nonzero(ds) == 0
     assert actual[-1].shape == state.shape
+
+
+def test_unaligned_vectors_backward_matches_aligned():
+    """Contiguous views need not have the 16-byte alignment required by cp.async."""
+    xs, state, mask = inputs(torch.float32, 17, B=1, H=2)
+    mask.fill_(True)
+    unaligned = []
+    for x in xs:
+        view = torch.empty(x.numel() + 1, device="cuda")[1:].view_as(x)
+        view.copy_(x)
+        assert view.is_contiguous() and view.data_ptr() % 16
+        unaligned.append(view.requires_grad_())
+    aligned = [x.detach().clone().requires_grad_() for x in xs]
+    y, s = wkv7(*unaligned, state, mask)
+    expected, final = wkv7(*aligned, state, mask)
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
+    torch.testing.assert_close(s, final, atol=0, rtol=0)
+    dy, ds = torch.randn_like(y), torch.randn_like(s)
+    actual_grads = torch.autograd.grad((y, s), unaligned, (dy, ds))
+    expected_grads = torch.autograd.grad((expected, final), aligned, (dy, ds))
+    for actual, reference in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=2e-6, rtol=2e-5)

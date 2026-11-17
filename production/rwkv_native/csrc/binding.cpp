@@ -8,6 +8,7 @@ std::vector<Tensor> layer_norm_backward(Tensor, Tensor, Tensor, double);
 std::vector<Tensor> vres_backward(Tensor, Tensor, Tensor, Tensor, Tensor);
 std::vector<Tensor> readout_backward(std::vector<Tensor>, Tensor, int64_t);
 Tensor readout_forward(std::vector<Tensor>, int64_t);
+Tensor readout_packed_forward(std::vector<Tensor>, int64_t);
 std::vector<Tensor> mix_backward(Tensor, Tensor, std::vector<Tensor>, std::vector<Tensor>, Tensor);
 std::vector<Tensor> key_gate_backward(std::vector<Tensor>, std::vector<Tensor>, int64_t);
 std::vector<Tensor> key_gate_forward(std::vector<Tensor>, int64_t);
@@ -23,6 +24,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("vres_backward", &vres_backward);
     m.def("readout_backward", &readout_backward);
     m.def("readout_forward", &readout_forward);
+    m.def("readout_packed_forward", &readout_packed_forward);
     m.def("mix_backward", &mix_backward);
     m.def("key_gate_backward", &key_gate_backward);
     m.def("key_gate_forward", &key_gate_forward);

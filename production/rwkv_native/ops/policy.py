@@ -31,7 +31,7 @@ class ProjectionPolicy:
     lt_shapes: frozenset
 
     @classmethod
-    def build(cls, weights, *, backend, equivalent_tiles, grouped_inputs):
+    def build(cls, weights, *, backend, equivalent_tiles, grouped_inputs, consistency="strict"):
         grouped = {}
         for weight in projection_weights(weights):
             grouped.setdefault(tuple(weight.shape), []).append(weight)
@@ -40,7 +40,9 @@ class ProjectionPolicy:
         for shape, matrices in grouped.items():
             weight = matrices[0]
             aligned = all(w.data_ptr() % 16 == 0 for w in matrices)
-            if not aligned:
+            if consistency == "none" and backend != "fixed":
+                selected, reason = "torch", "shape-dependent GEMM; no forward equality guarantee"
+            elif not aligned:
                 selected, reason = "fixed", "unaligned weight uses the fixed CUDA fallback"
             elif (
                 grouped_inputs
@@ -67,7 +69,9 @@ class ProjectionPolicy:
                         stacklevel=3,
                     )
             choices[shape] = selected
-            label = {"fixed": "fixed CUDA", "pre_group": "grouped SM80 CUDA"}.get(
+            label = {
+                "fixed": "fixed CUDA", "pre_group": "grouped SM80 CUDA", "torch": "PyTorch GEMM"
+            }.get(
                 selected, "cuBLASLt"
             )
             report[shape] = {"backend": label, "reason": reason}

@@ -1,21 +1,25 @@
 """Production RWKV7: explicit blocks, projection policy and recurrent state."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
 from torch.autograd.function import once_differentiable
-from torch.nn import functional as F
 
+from .config import RuntimeConfig
+from ._extensions import extension
 from .ops.attention import PROJECTION_BRANCHES, attention_frontend
 from .ops.channel import channel_frontend
-from .ops.gemm import matmul
+from .ops.gemm import matmul, can_pack_ffn_key
 from .ops.key_gate import key_gate
-from .ops.normalization import SIGMOID, TANH, activate, layer_norm, value_blend
+from .ops.normalization import SIGMOID, TANH, layer_norm, value_blend
 from .ops.policy import EXPANSION_SHAPES, LOW_RANK_SUFFIXES, ProjectionPolicy
 from .ops.rank_group import expand_low_rank
+from .ops.decode import expand_rank as expand_decode_rank
 from .ops.readout import readout
+from .ops.sparse_ffn import sparse_ffn
 from .ops.wkv import wkv7
+from .ops.wkv_inference import inference_schedule, attention_inference
 from .state import State, token_shift
 
 
@@ -27,16 +31,15 @@ class _Embedding(torch.autograd.Function):
         ctx.save_for_backward(tokens)
         ctx.rows = weight.shape[0]
         ctx.dtype = weight.dtype
-        return F.embedding(tokens, weight).float()
+        return extension("embedding").forward(tokens.contiguous(),weight)
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad):
         (tokens,) = ctx.saved_tensors
-        dw = torch.ops.aten.embedding_dense_backward.default(
-            grad.contiguous(), tokens, ctx.rows, -1, False
-        )
-        return None, dw.to(ctx.dtype)
+        dw = extension("embedding").backward(grad.contiguous(),tokens.contiguous(),ctx.rows,
+                                             ctx.dtype==torch.bfloat16)
+        return None, dw
 
 
 @dataclass
@@ -48,11 +51,11 @@ class _ProjectionContext:
     valid_indices: torch.Tensor | None
     can_fuse: bool
 
-    def project(self, value, weight, *, relu_squared=False):
+    def project(self, value, weight, *, relu_squared=False, activation=0):
         if self.valid_indices is None:
-            return self.model.project(value, weight, relu_squared=relu_squared)
+            return self.model.project(value, weight, relu_squared=relu_squared, activation=activation)
         compact = value.reshape(-1, value.shape[-1]).index_select(0, self.valid_indices)
-        projected = self.model.project(compact, weight, relu_squared=relu_squared)
+        projected = self.model.project(compact, weight, relu_squared=relu_squared, activation=activation)
         output = projected.new_zeros(value.shape[0] * value.shape[1], weight.shape[1])
         return output.index_copy(0, self.valid_indices, projected).view(
             *value.shape[:-1], weight.shape[1]
@@ -65,9 +68,11 @@ class _ProjectionContext:
 class FastRWKV7(nn.Module):
     """RWKV7 with FP16/BF16 weights and FP32 activations, adjoints and KV state.
 
-    ``backend='auto'`` selects a model-wide arithmetic policy for each weight
-    shape. ``backend='fixed'`` forces the portable CUDA fallback. Fusion flags
-    are diagnostic switches; defaults use the validated production paths.
+    PyTorch's gradient switch selects training or inference. ``precision`` selects
+    FP16/BF16 weights and projection operands, with FP32 activations and state.
+    ``consistency='strict'`` retains the shared, batch-invariant forward;
+    ``'none'`` permits shape-dependent GEMMs. Neither constrains backward order.
+    ``backend='fixed'`` remains a diagnostic override for projections.
     """
 
     def __init__(
@@ -75,7 +80,9 @@ class FastRWKV7(nn.Module):
         weights,
         *,
         device="cuda",
-        dtype=torch.float16,
+        dtype=None,
+        precision=None,
+        consistency="strict",
         backend="auto",
         adjoint_mode="store",
         fused_frontend=True,
@@ -83,8 +90,13 @@ class FastRWKV7(nn.Module):
         fused_attention=True,
         fused_rank_group=True,
         fused_pre_group=True,
+        sparse_ffn=True,
     ):
         super().__init__()
+        self.config = RuntimeConfig.resolve(
+            precision=precision, consistency=consistency, dtype=dtype
+        )
+        dtype = self.config.dtype
         if backend not in ("auto", "fixed"):
             raise ValueError("backend must be auto or fixed")
         if adjoint_mode not in ("store", "fp32"):
@@ -99,9 +111,10 @@ class FastRWKV7(nn.Module):
             max(int(name.split(".")[1]) for name in weights if name.startswith("blocks.")) + 1
         )
         self.weights = nn.ParameterDict()
+        self.sparse_ffn = sparse_ffn and self.config.consistency == "none" and backend != "fixed"
         for name, tensor in weights.items():
             value = tensor.to(device=device, dtype=dtype).contiguous()
-            if name.endswith(LOW_RANK_SUFFIXES):
+            if name.endswith(LOW_RANK_SUFFIXES) or (self.sparse_ffn and name.endswith("ffn.value.weight")):
                 value = value.T.contiguous().T
             self.weights[name.replace(".", "__")] = nn.Parameter(value)
         self.adjoint_mode = adjoint_mode
@@ -132,6 +145,7 @@ class FastRWKV7(nn.Module):
             backend=self._backend_request,
             equivalent_tiles=self.equivalent_tiles,
             grouped_inputs=self.fused_pre_group,
+            consistency=self.config.consistency,
         )
         self.backend_report = self._projection_policy.report
         self.lt_shapes = self._projection_policy.lt_shapes
@@ -140,6 +154,10 @@ class FastRWKV7(nn.Module):
         result = super()._apply(fn, recurse=recurse)
         if hasattr(self, "_backend_request"):
             self._configure_backend()
+            self.config = replace(
+                self.config,
+                precision="fp16" if self.weight("emb.weight").dtype == torch.float16 else "bf16",
+            )
         return result
 
     def initial_state(self, batch):
@@ -153,11 +171,23 @@ class FastRWKV7(nn.Module):
     def projection_backend(self, weight):
         return self._projection_policy.backends.get(tuple(weight.shape), "fixed")
 
-    def project(self, value, weight, *, relu_squared=False):
+    def training_loss(self, hidden, targets, *, chunk_rows=128):
+        """All-token mean CE, streaming the vocabulary head and its gradients.
+
+        ``hidden`` comes from ``forward_features``; targets equal to -100 are
+        ignored. The projection follows this model's forward precision policy.
+        """
+        from .ops.loss import head_cross_entropy
+        weight = self.weight("head.weight")
+        return head_cross_entropy(hidden,weight,targets,chunk_rows=chunk_rows,
+                                  backend=self.projection_backend(weight.T),adjoint_mode=self.adjoint_mode)
+
+    def project(self, value, weight, *, relu_squared=False, activation=0):
         return matmul(
             value,
             weight,
             relu_squared=relu_squared,
+            activation=activation,
             adjoint_mode=self.adjoint_mode,
             backend=self.projection_backend(weight),
         )
@@ -201,18 +231,32 @@ class FastRWKV7(nn.Module):
         weights = tuple(self.weight(prefix + name + "2") for name in rank_branches)
         grouped = (
             self.fused_rank_group
+            and self.config.consistency == "strict"
             and tuple(tuple(w.shape) for w in weights) == EXPANSION_SHAPES[: len(weights)]
             and all(w.dtype == torch.float16 for w in weights)
         )
-        if grouped:
+        if (self.fused_rank_group and self.config.consistency == 'strict'
+                and context.can_fuse and batch == tokens == 1 and self.width in (2560,4096)
+                and all(0 < w.shape[0] <= 512 and w.shape[0] % 32 == 0 for w in weights)
+                and not torch.is_grad_enabled()):
+            expanded=expand_decode_rank(reduced,weights)
+        elif grouped:
             expanded = expand_low_rank(reduced, weights, self.adjoint_mode)
         else:
-            activated = (
-                activate(reduced[0], TANH),
-                reduced[1],
-                activate(reduced[2], SIGMOID),
-            ) + tuple(reduced[3:])
-            expanded = context.project_many(activated, weights)
+            expanded = tuple(context.project(value,weight,activation=kind)
+                             for value,weight,kind in zip(reduced,weights,(TANH,0,SIGMOID,0)))
+        schedule = (inference_schedule(batch, tokens, self.heads)
+                    if self.fused_attention and context.can_fuse and not torch.is_grad_enabled()
+                    else None)
+        if batch == tokens == 1 and self.config.consistency != 'strict':
+            schedule = None
+        if schedule is not None:
+            names = ("r_k", "ln_x.weight", "ln_x.bias", "w0", "k_k", "a0", "k_a",
+                     "v0" if layer else "w0")
+            mixed, next_matrix, first_value = attention_inference(
+                schedule, r, k, v, expanded, first_value, matrix, context.mask,
+                [self.weight(prefix + name) for name in names], self.heads)
+            return mixed, first_value, shift, next_matrix
         decay = expanded[0] + self.weight(prefix + "w0")
         gate = expanded[2]
         if layer == 0:
@@ -237,6 +281,8 @@ class FastRWKV7(nn.Module):
             adapted_key.view(shape),
             matrix,
             context.mask,
+            approximate_backward=(self.config.consistency == "none" and tokens >= 256
+                                  and context.valid_indices is None),
         )
         mixed = readout(
             y.view(batch, tokens, self.width),
@@ -248,6 +294,7 @@ class FastRWKV7(nn.Module):
             self.weight(prefix + "ln_x.bias"),
             gate,
             self.heads,
+            packed=not torch.is_grad_enabled(),
         )
         return mixed, first_value, shift, next_matrix
 
@@ -256,7 +303,10 @@ class FastRWKV7(nn.Module):
         output_weight = self.weight(root + "att.output.weight").T
         key_weight = self.weight(root + "ffn.key.weight").T
         backends = (self.projection_backend(output_weight), self.projection_backend(key_weight))
-        if self.fused_frontend and context.can_fuse and "fixed" not in backends:
+        packed_relu = False
+        if self.fused_frontend and context.can_fuse:
+            packed_relu = (not torch.is_grad_enabled() and
+                           can_pack_ffn_key(x.shape[0]*x.shape[1],key_weight,backends[1]))
             key, shift, residual = channel_frontend(
                 x,
                 mixed,
@@ -269,6 +319,7 @@ class FastRWKV7(nn.Module):
                 context.mask,
                 self.adjoint_mode,
                 backends,
+                packed_relu=packed_relu,
             )
         else:
             residual = x + context.project(mixed, output_weight)
@@ -276,9 +327,52 @@ class FastRWKV7(nn.Module):
             past, shift = token_shift(normalized, previous, context.mask)
             key = normalized + (past - normalized) * self.weight(root + "ffn.x_k")
             key = context.project(key, key_weight)
-        output = residual + context.project(
-            key, self.weight(root + "ffn.value.weight").T, relu_squared=True
-        )
+        down_weight = self.weight(root + "ffn.value.weight").T
+        rows = x.shape[0] * x.shape[1]
+        # Preserve the strict split boundaries, while loading either dense
+        # layout directly and adding the residual in the GEMM epilogue.
+        ordered_down = (self.config.consistency == "strict" and
+                        self.projection_backend(down_weight) == "fixed")
+        accurate_none_down = (self.config.consistency == "none" and self.width == 2560
+                              and down_weight.dtype == torch.bfloat16)
+        if (not torch.is_grad_enabled() and context.can_fuse and rows >= 2048
+                and self.width in (2560,4096) and (ordered_down or accurate_none_down)):
+            operand = key.reshape(-1,key.shape[-1])
+            if not packed_relu:
+                operand = extension("ops").activation_pack(operand, down_weight.dtype == torch.bfloat16, 1)
+            output = extension("ffn_down").run(
+                operand, down_weight, residual.reshape(-1,self.width), True).view_as(residual)
+            return output, shift
+        # A row-major sparse weight must not silently select a less accurate
+        # dense cuBLAS reduction. This direct-layout CUDA path avoids repacking
+        # those weights and retains the original up projection for BF16.
+        if (not torch.is_grad_enabled() and context.can_fuse and x.shape[1] > 1
+                and self.config.consistency == "none" and self.width == 4096
+                and down_weight.dtype == torch.bfloat16):
+            operand = key.reshape(-1,key.shape[-1])
+            if not packed_relu:
+                operand = extension("ops").activation_pack(operand, True, 1)
+            tile = 16 if rows <= 16 else 64128 if rows <= 320 else 132
+            output = extension("flash_linear").run_residual(
+                operand, down_weight.T, residual.reshape(-1,self.width), tile).view_as(residual)
+            return output, shift
+        if self.sparse_ffn and not torch.is_grad_enabled() and key.shape[0] * key.shape[1] <= 4:
+            output = residual + sparse_ffn(key, down_weight)
+        elif (packed_relu and key.dtype == torch.bfloat16 and self.width != 2560
+              and self.projection_backend(down_weight) == "torch"):
+            # The inference up projection already produced ReLU² operands.
+            # Add the residual in the down GEMM epilogue, without another
+            # FP32 projection output and elementwise-add launch.
+            # FP16 retains its established reduction: canonical unsplit down
+            # arithmetic exceeded the full-model FP64 logits RMSE limit.
+            # The same gate rejects BF16 width 2560 on long real-model input.
+            output = extension("flash_linear").run_residual(
+                key.reshape(-1,key.shape[-1]), down_weight.T,
+                residual.reshape(-1,residual.shape[-1]),
+                132 if residual.shape[-1] == 4096 else 128,
+            ).view_as(residual)
+        else:
+            output = residual + context.project(key, down_weight, relu_squared=not packed_relu)
         return output, shift
 
     def _forward_block(self, x, first_value, attention, channel, matrix, *, layer, context):
@@ -305,7 +399,8 @@ class FastRWKV7(nn.Module):
             self, mask, indices, tokens.shape[1] == 1 or attention_mask is None
         )
         state = self.initial_state(tokens.shape[0]) if state is None else state
-        x = _Embedding.apply(tokens.masked_fill(~mask, 0), self.weight("emb.weight"))
+        embedding_tokens = tokens if attention_mask is None else tokens.masked_fill(~mask,0)
+        x = _Embedding.apply(embedding_tokens, self.weight("emb.weight"))
         x = self._normalize(x, "blocks.0.ln0")
         next_state = State([], [], [])
         first_value = None
@@ -314,14 +409,26 @@ class FastRWKV7(nn.Module):
             if checkpoint_blocks and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
 
-                result = checkpoint(
-                    self._forward_block,
-                    *args,
-                    layer=layer,
-                    context=context,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
+                if self.config.precision == "bf16" and x.shape[0]*x.shape[1] >= 4096:
+                    # Replay attention and FFN separately so their saved tensors
+                    # are not simultaneously resident during the large backward.
+                    mixed, first_value, attention, matrix = checkpoint(
+                        self._attention, x, state.attention[layer], state.wkv[layer],
+                        first_value, context, layer, use_reentrant=False,
+                        preserve_rng_state=False)
+                    x, channel = checkpoint(
+                        self._channel, x, mixed, state.channel[layer], context, layer,
+                        use_reentrant=False, preserve_rng_state=False)
+                    result = x, first_value, attention, channel, matrix
+                else:
+                    result = checkpoint(
+                        self._forward_block,
+                        *args,
+                        layer=layer,
+                        context=context,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
             else:
                 result = self._forward_block(*args, layer=layer, context=context)
             x, first_value, attention, channel, matrix = result
@@ -343,4 +450,4 @@ class FastRWKV7(nn.Module):
         else:
             logits = context.project(features, self.weight("head.weight").T)
             mask = context.mask
-        return logits.masked_fill(~mask[..., None], 0), state
+        return (logits if attention_mask is None else logits.masked_fill(~mask[..., None],0)), state

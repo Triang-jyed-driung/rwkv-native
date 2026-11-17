@@ -3,7 +3,7 @@
 Inputs: six [B,T,H,64] tensors (BF16, FP16 or FP32); FP32 state [B,H,K,V] with K=V=64.
 attention_mask: boolean [B,T]. False tokens neither read nor update the state.
 Output: y in input dtype, final state in FP32. The input state is never mutated.
-Backward replays checkpointed forward segments, avoiding unstable state inversion.
+FP32 backward reconstructs at most 16 steps between canonical checkpoints.
 Only first-order differentiation is currently implemented.
 """
 
@@ -17,8 +17,9 @@ class _WKV(torch.autograd.Function):
     @staticmethod
     def forward(ctx, r, w, k, v, a, b, state, mask, checkpoint_size):
         needs_backward = any(ctx.needs_input_grad[:7])
-        y, final, checkpoints = extension("core").forward(
-            r, w, k, v, a, b, state, mask, checkpoint_size, needs_backward
+        from .wkv_training import forward
+        y, final, checkpoints = forward(
+            (r,w,k,v,a,b),state,mask,checkpoint_size,needs_backward
         )
         if needs_backward:
             ctx.save_for_backward(r, w, k, v, a, b, mask, checkpoints)
@@ -34,6 +35,10 @@ class _WKV(torch.autograd.Function):
             dy = torch.zeros_like(r)
         if ds is None:
             ds = torch.empty(0, device=r.device, dtype=torch.float32)
+        if r.dtype == torch.float32 and ctx.checkpoint_size == 16 and r.shape[1] >= 256:
+            gradients = extension("wkv_simt_backward").run(
+                [r,w,k,v,a,b],mask,checkpoints,dy.contiguous(),ds.contiguous(),0)
+            return (*gradients,None,None)
         gradients = extension("core").backward(
             r,
             w,
@@ -50,7 +55,7 @@ class _WKV(torch.autograd.Function):
         return (*gradients, None, None)
 
 
-def wkv7(r, w, k, v, a, b, state=None, attention_mask=None, *, checkpoint_size=16):
+def wkv7(r, w, k, v, a, b, state=None, attention_mask=None, *, checkpoint_size=16, approximate_backward=False):
     """RWKV-7 with FP32 [B,H,K,V] state; padding and mask holes are skipped."""
     if r.ndim != 4 or r.shape[-1] != 64 or min(r.shape) < 1:
         raise ValueError("inputs must have nonempty shape [B,T,H,64]")
@@ -74,6 +79,18 @@ def wkv7(r, w, k, v, a, b, state=None, attention_mask=None, *, checkpoint_size=1
         raise ValueError("attention_mask must be bool [B,T] on the input device")
     if not isinstance(checkpoint_size, int) or not 1 <= checkpoint_size <= 256:
         raise ValueError("checkpoint_size must be an integer between 1 and 256")
-    return _WKV.apply(
-        *(x.contiguous() for x in (r, w, k, v, a, b, state, attention_mask)), checkpoint_size
-    )
+    vectors = tuple(x.contiguous() for x in (r, w, k, v, a, b))
+    T = r.shape[1]
+    prefetched = (r.dtype == torch.float32 and
+                  ((B*H >= 128 and T >= 8) or (T == 1 and B*H >= 512)) and
+                  all(x.data_ptr() % 16 == 0 for x in vectors))
+    if not (prefetched and state.stride(0) >= 0 and state.stride()[1:] == (D*D, D, 1)):
+        state = state.contiguous()
+    inputs = (*vectors, state, attention_mask.contiguous())
+    if not torch.is_grad_enabled() or not any(x.requires_grad for x in inputs[:7]):
+        y, final, _ = extension("core").forward(*inputs, checkpoint_size, False)
+        return y, final
+    if approximate_backward and T >= 256 and r.dtype == torch.float32 and checkpoint_size == 16:
+        from .wkv_mma import _MMAWKV
+        return _MMAWKV.apply(*inputs)
+    return _WKV.apply(*inputs, checkpoint_size)

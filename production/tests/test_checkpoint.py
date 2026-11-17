@@ -2,8 +2,7 @@
 
 import pytest
 import torch
-from conftest import tiny_weights
-from test_consistent_backend import states_close
+from conftest import tiny_weights, states_close
 
 from rwkv_native import FastRWKV7
 

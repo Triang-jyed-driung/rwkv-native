@@ -19,8 +19,8 @@ class _KeyGate(torch.autograd.Function):
     def backward(ctx, *grads):
         xs = ctx.saved_tensors
         grads = [grad.contiguous() if grad is not None else xs[0].new_empty(0) for grad in grads]
-        gradients = extension("core").key_gate_backward([x.float() for x in xs], grads, ctx.heads)
-        return None, *[grad.to(x.dtype) for grad, x in zip(gradients, xs)]
+        gradients = extension("core").key_gate_backward(list(xs), grads, ctx.heads)
+        return None, *gradients
 
 
 def key_gate(key, scale, bias, raw, adapt, heads):

@@ -39,3 +39,11 @@ def tiny_weights(width=64):
         weights[f + "key.weight"] = torch.randn(4 * C, C) * 0.1
         weights[f + "value.weight"] = torch.randn(C, 4 * C) * 0.1
     return weights
+
+
+def states_close(a, b, order=None):
+    for name in ("attention", "channel", "wkv"):
+        actual, expected = getattr(a, name), getattr(b, name)
+        assert len(actual) == len(expected)
+        for x, y in zip(actual, expected):
+            torch.testing.assert_close(x, y if order is None else y[order], atol=0, rtol=0)

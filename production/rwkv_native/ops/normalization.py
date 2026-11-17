@@ -10,9 +10,9 @@ RELU_SQUARED, TANH, SIGMOID = 1, 2, 3
 
 def layer_norm_backward(value, weight, grad):
     dx, dw, db = extension("core").layer_norm_backward(
-        value, weight.float(), grad.contiguous(), 1e-5
+        value, weight, grad.contiguous(), 1e-5
     )
-    return dx, dw.to(weight.dtype), db.to(weight.dtype)
+    return dx, dw, db
 
 
 def norm_shift_backward(value, normalized, previous, weight, coefficients, grads, state_grad, mask):
@@ -21,7 +21,7 @@ def norm_shift_backward(value, normalized, previous, weight, coefficients, grads
     normalized_grad, previous_grad, *coefficient_grads = extension("core").mix_backward(
         normalized,
         previous,
-        [coefficient.float() for coefficient in coefficients],
+        list(coefficients),
         grads,
         torch.where(mask, state_grad, 0) if decode else state_grad,
     )
@@ -33,7 +33,7 @@ def norm_shift_backward(value, normalized, previous, weight, coefficients, grads
         previous_grad,
         weight_grad,
         bias_grad,
-        *[grad.to(coefficient.dtype) for grad, coefficient in zip(coefficient_grads, coefficients)],
+        *coefficient_grads,
     )
 
 
@@ -85,9 +85,9 @@ class _ValueBlend(torch.autograd.Function):
     def backward(ctx, grad):
         value, first, bias, raw = ctx.saved_tensors
         value_grad, first_grad, bias_grad, raw_grad = extension("core").vres_backward(
-            value, first, bias.float(), raw, grad.contiguous()
+            value, first, bias, raw, grad.contiguous()
         )
-        return value_grad, first_grad, bias_grad.to(bias.dtype), raw_grad
+        return value_grad, first_grad, bias_grad, raw_grad
 
 
 def value_blend(value, first, bias, raw):

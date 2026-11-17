@@ -212,35 +212,116 @@ __global__ void replay_parallel(const float *decay, const scalar_t *k, const sca
     }
 }
 
-template <typename scalar_t>
-__global__ void backward_parallel(const scalar_t *r, const scalar_t *w, const scalar_t *k,
+template <typename scalar_t, int ROWS = 64>
+__global__ void backward_persistent(const scalar_t *r, const scalar_t *w, const scalar_t *k,
                                   const scalar_t *v, const scalar_t *a, const scalar_t *b,
-                                  const bool *mask, const float *replay, const scalar_t *dy,
+                                  const bool *mask, float *replay, const scalar_t *dy,
                                   float *ds, scalar_t *dr, scalar_t *dw, scalar_t *dk, scalar_t *dv,
-                                  scalar_t *da, scalar_t *db, int T, int H, int chunk, int start,
-                                  int stop, const float *incoming_gradient) {
+                                  scalar_t *da, scalar_t *db, int T, int H, int chunk, int count,
+                                  const float *cp, const float *decay,
+                                  const float *incoming_gradient) {
     int tid = threadIdx.x, lane = tid % 8, row = tid / 8;
+    constexpr int PARTS = ROWS / 8;
+    int value_base = blockIdx.y * ROWS, value_row = value_base + row;
     int key = tid % 64, part = tid / 64;
     int batch = blockIdx.x / H, head = blockIdx.x % H;
     int64_t base = int64_t(blockIdx.x) * D * D;
     float grad[8];
     // XOR row swizzle makes both 8-lane row access and column access bank-conflict free.
-    __shared__ float old[D][D], g[D][D];
+    __shared__ float old[ROWS][D], g[ROWS][D];
     __shared__ float rr[D], dd[D], kk[D], vv[D], aa[D], bb[D], yy[D], sa[D], ga[D];
-    __shared__ float partial[5][8][D];
+    __shared__ float partial[5][PARTS][D];
+    __shared__ __align__(16) float staged[ROWS == 32 ? 6 * 16 * D : 1];
+    const bool aligned = ((reinterpret_cast<unsigned long long>(r) |
+                           reinterpret_cast<unsigned long long>(k) |
+                           reinterpret_cast<unsigned long long>(v) |
+                           reinterpret_cast<unsigned long long>(a) |
+                           reinterpret_cast<unsigned long long>(b) |
+                           reinterpret_cast<unsigned long long>(dy)) & 15ULL) == 0;
+    const bool stage_inputs = ROWS == 32 && chunk <= 16 && aligned;
 #pragma unroll
     for (int q = 0; q < 8; ++q)
-        grad[q] = incoming_gradient ? incoming_gradient[base + (lane + q * 8) * D + row] : 0.f;
+        grad[q] = incoming_gradient ? incoming_gradient[base + (lane + q * 8) * D + value_row] : 0.f;
+    // One CTA owns a full head through every segment. Replay and reverse share
+    // the same eight-lane value-row ownership; no cross-CTA synchronization is
+    // needed and the adjoint stays in registers across checkpoint boundaries.
+    for (int c = count - 1; c >= 0; --c) {
+        int start = c * chunk, stop = min(T, start + chunk);
+        if constexpr (ROWS == 32) {
+            if (stage_inputs) {
+                const float *sources[6] = {r, k, v, a, b, dy};
+#pragma unroll
+                for (int q = 0; q < 6; ++q) {
+                    for (int vector = tid; vector < (stop - start) * (D / 4); vector += ROWS * 8) {
+                        int token = vector / (D / 4), key4 = (vector % (D / 4)) * 4;
+                        int64_t src = ((int64_t(batch) * T + start + token) * H + head) * D + key4;
+                        unsigned dst = __cvta_generic_to_shared(staged + q * 16 * D + token * D + key4);
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                                     :: "r"(dst), "l"(sources[q] + src) : "memory");
+                    }
+                }
+                asm volatile("cp.async.commit_group;" ::: "memory");
+                asm volatile("cp.async.wait_group 0;" ::: "memory");
+                __syncthreads();
+            }
+        }
+        int64_t checkpoint_base = (int64_t(blockIdx.x) * count + c) * D * D;
+        float replay_state[8];
+#pragma unroll
+        for (int q = 0; q < 8; ++q)
+            replay_state[q] = cp[checkpoint_base + (lane + 8 * q) * D + value_row];
+        for (int t = start; t < stop; ++t) {
+            int64_t rp = (int64_t(blockIdx.x) * chunk + t - start) * D * D + value_row * D;
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+                replay[rp + lane + 8 * q] = replay_state[q];
+            if (!mask[int64_t(batch) * T + t])
+                continue;
+            int64_t idx = ((int64_t(batch) * T + t) * H + head) * D;
+            int tile = (t - start) * D;
+            float dot = 0.f;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                int j = lane + 8 * q;
+                dot = fmaf(replay_state[q], stage_inputs ? staged[3 * 16 * D + tile + j] : float(a[idx + j]), dot);
+            }
+            dot = sum8(dot);
+            float value = stage_inputs ? staged[2 * 16 * D + tile + value_row] : float(v[idx + value_row]);
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                int j = lane + 8 * q;
+                float d = decay[idx + j];
+                float bv = stage_inputs ? staged[4 * 16 * D + tile + j] : float(b[idx + j]);
+                float kv = stage_inputs ? staged[1 * 16 * D + tile + j] : float(k[idx + j]);
+                replay_state[q] = fmaf(replay_state[q], d, fmaf(dot, bv, kv * value));
+            }
+        }
+        __syncthreads();
     for (int t = stop - 1; t >= start; --t) {
         int64_t idx = ((int64_t(batch) * T + t) * H + head) * D;
         if (!mask[int64_t(batch) * T + t]) {
+            if constexpr (ROWS == 32) {
+                if (tid < ROWS)
+                    dv[idx + value_base + tid] = 0.f;
+            } else {
             if (tid < D)
                 dr[idx + tid] = dw[idx + tid] = dk[idx + tid] = dv[idx + tid] = da[idx + tid] =
                     db[idx + tid] = scalar_t(0.f);
+            }
             continue;
         }
         __syncthreads();
         if (tid < D) {
+            if (stage_inputs) {
+                int tile = (t - start) * D + tid;
+                rr[tid] = staged[tile];
+                kk[tid] = staged[1 * 16 * D + tile];
+                vv[tid] = staged[2 * 16 * D + tile];
+                aa[tid] = staged[3 * 16 * D + tile];
+                bb[tid] = staged[4 * 16 * D + tile];
+                yy[tid] = staged[5 * 16 * D + tile];
+                dd[tid] = decay[idx + tid];
+            } else {
             rr[tid] = float(r[idx + tid]);
             dd[tid] = expf(DECAY_SCALE / (1.f + expf(-float(w[idx + tid]))));
             kk[tid] = float(k[idx + tid]);
@@ -248,8 +329,9 @@ __global__ void backward_parallel(const scalar_t *r, const scalar_t *w, const sc
             aa[tid] = float(a[idx + tid]);
             bb[tid] = float(b[idx + tid]);
             yy[tid] = float(dy[idx + tid]);
+            }
         }
-        int64_t rp = (int64_t(blockIdx.x) * chunk + t - start) * D * D + row * D;
+        int64_t rp = (int64_t(blockIdx.x) * chunk + t - start) * D * D + value_row * D;
 #pragma unroll
         for (int q = 0; q < 8; ++q)
             old[row][(lane + q * 8) ^ ((row & 3) * 8)] = replay[rp + lane + q * 8];
@@ -259,7 +341,7 @@ __global__ void backward_parallel(const scalar_t *r, const scalar_t *w, const sc
         for (int q = 0; q < 8; ++q) {
             int j = lane + q * 8;
             sai = fmaf(old[row][j ^ ((row & 3) * 8)], aa[j], sai);
-            grad[q] = fmaf(yy[row], rr[j], grad[q]);
+            grad[q] = fmaf(yy[value_row], rr[j], grad[q]);
             g[row][j ^ ((row & 3) * 8)] = grad[q];
             gai = fmaf(grad[q], bb[j], gai);
             dvi = fmaf(grad[q], kk[j], dvi);
@@ -270,17 +352,17 @@ __global__ void backward_parallel(const scalar_t *r, const scalar_t *w, const sc
         if (lane == 0) {
             sa[row] = sai;
             ga[row] = gai;
-            dv[idx + row] = scalar_t(dvi);
+            dv[idx + value_row] = scalar_t(dvi);
         }
         __syncthreads();
         float dri = 0.f, dwi = 0.f, dki = 0.f, dai = 0.f, dbi = 0.f;
 #pragma unroll
-        for (int i = part; i < D; i += 8) {
+        for (int i = part; i < ROWS; i += PARTS) {
             float ns =
-                fmaf(old[i][key ^ ((i & 3) * 8)], dd[key], fmaf(sa[i], bb[key], kk[key] * vv[i]));
-            dri = fmaf(ns, yy[i], dri);
+                fmaf(old[i][key ^ ((i & 3) * 8)], dd[key], fmaf(sa[i], bb[key], kk[key] * vv[value_base + i]));
+            dri = fmaf(ns, yy[value_base + i], dri);
             dwi = fmaf(g[i][key ^ ((i & 3) * 8)], old[i][key ^ ((i & 3) * 8)], dwi);
-            dki = fmaf(g[i][key ^ ((i & 3) * 8)], vv[i], dki);
+            dki = fmaf(g[i][key ^ ((i & 3) * 8)], vv[value_base + i], dki);
             dai = fmaf(ga[i], old[i][key ^ ((i & 3) * 8)], dai);
             dbi = fmaf(g[i][key ^ ((i & 3) * 8)], sa[i], dbi);
         }
@@ -296,22 +378,56 @@ __global__ void backward_parallel(const scalar_t *r, const scalar_t *w, const sc
         if (tid < D) {
             float sums[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-            for (int p = 0; p < 8; ++p) {
+            for (int p = 0; p < PARTS; ++p) {
 #pragma unroll
                 for (int n = 0; n < 5; ++n)
                     sums[n] += partial[n][p][tid];
             }
+            if constexpr (ROWS == 32) {
+                // Exactly two FP32 partials per output. Both orders give the
+                // same rounded sum, without a T-sized partial-gradient buffer.
+                atomicAdd(dr + idx + tid, sums[0]);
+                atomicAdd(dw + idx + tid, sums[1]);
+                atomicAdd(dk + idx + tid, sums[2]);
+                atomicAdd(da + idx + tid, sums[3]);
+                atomicAdd(db + idx + tid, sums[4]);
+            } else {
             float sig = 1.f / (1.f + expf(-float(w[idx + tid])));
             dr[idx + tid] = scalar_t(sums[0]);
             dw[idx + tid] = scalar_t(sums[1] * dd[tid] * DECAY_SCALE * sig * (1.f - sig));
             dk[idx + tid] = scalar_t(sums[2]);
             da[idx + tid] = scalar_t(sums[3]);
             db[idx + tid] = scalar_t(sums[4]);
+            }
         }
+    }
+    __syncthreads();
     }
 #pragma unroll
     for (int q = 0; q < 8; ++q)
-        ds[base + (lane + q * 8) * D + row] = grad[q];
+        ds[base + (lane + q * 8) * D + value_row] = grad[q];
+}
+
+__global__ void prepare_split_backward(const float *w, float *decay, float *dr,
+                                      float *dw, float *dk, float *da, float *db, int64_t n) {
+    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        decay[i] = expf(DECAY_SCALE / (1.f + expf(-w[i])));
+        dr[i] = dw[i] = dk[i] = da[i] = db[i] = 0.f;
+    }
+}
+
+__global__ void finish_split_dw(const float *w, const float *decay, const bool *mask,
+                                float *dw, int64_t n, int channels) {
+    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        if (!mask[i / channels]) {
+            dw[i] = 0.f;
+            return;
+        }
+        float sig = 1.f / (1.f + expf(-w[i]));
+        dw[i] = dw[i] * decay[i] * DECAY_SCALE * sig * (1.f - sig);
+    }
 }
 
 void check_inputs(const Tensor &r, const std::vector<Tensor> &xs, const Tensor &mask) {
@@ -330,25 +446,70 @@ void check_inputs(const Tensor &r, const std::vector<Tensor> &xs, const Tensor &
                 "invalid mask");
 }
 
+#include "wkv_prefetch.cuh"
+#include "wkv_register_prefetch.cuh"
+
 std::vector<Tensor> wkv_forward(Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, Tensor b,
                                 Tensor initial, Tensor mask, int64_t chunk, bool save) {
     check_inputs(r, {w, k, v, a, b}, mask);
     TORCH_CHECK(chunk >= 1 && chunk <= 256, "invalid checkpoint size");
     c10::cuda::CUDAGuard guard(r.device());
     int B = r.size(0), T = r.size(1), H = r.size(2), count = (T + chunk - 1) / chunk;
+    bool aligned = true;
+    for (const auto &input : {r,w,k,v,a,b})
+        aligned = aligned && reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0;
+    const bool prefetched = r.scalar_type() == at::kFloat && aligned &&
+        ((B*H >= 128 && T >= 8) || (T == 1 && B*H >= 512));
     TORCH_CHECK(initial.device() == r.device() && initial.scalar_type() == at::kFloat &&
-                    initial.is_contiguous() && initial.sizes() == at::IntArrayRef({B, H, D, D}),
+                    initial.sizes() == at::IntArrayRef({B, H, D, D}) &&
+                    (initial.is_contiguous() || (prefetched && initial.stride(0)>=0 &&
+                     initial.stride(1)==D*D && initial.stride(2)==D && initial.stride(3)==1)),
                 "invalid initial state");
-    auto y = at::empty_like(r), final = at::empty_like(initial);
+    auto y = at::empty_like(r), final = at::empty({B,H,D,D}, initial.options());
     auto cp = at::empty({B, H, save ? count : 0, D, D}, initial.options());
-    auto decay = at::empty({T > 1 ? r.numel() : 0}, initial.options());
     auto stream = c10::cuda::getCurrentCUDAStream();
+    if (prefetched) {
+        // Copy several token vectors once per head and evaluate decay in the
+        // staging pass. The compile-time reduction tree matches warp rows.
+#define WKV_PREFETCH(P,S) forward_prefetched_float<P,S><<<B*H,64,0,stream>>>( \
+            r.data_ptr<float>(),w.data_ptr<float>(),k.data_ptr<float>(),v.data_ptr<float>(), \
+            a.data_ptr<float>(),b.data_ptr<float>(),initial.data_ptr<float>(),mask.data_ptr<bool>(), \
+            y.data_ptr<float>(),final.data_ptr<float>(),cp.data_ptr<float>(),T,H,chunk,count,initial.stride(0))
+        if (T == 1) {
+            if (save) { WKV_PREFETCH(1,true); } else { WKV_PREFETCH(1,false); }
+        } else if (T < 32) {
+            if (save) { WKV_PREFETCH(2,true); } else { WKV_PREFETCH(2,false); }
+        } else {
+            if (save) { WKV_PREFETCH(4,true); } else { WKV_PREFETCH(4,false); }
+        }
+#undef WKV_PREFETCH
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return {y,final,cp};
+    }
+    auto decay = at::empty({T > 1 ? r.numel() : 0}, initial.options());
+    if (!save && r.scalar_type() == at::kFloat && B * H >= 32 && B * H < 128 && T >= 256) {
+        prepare_decay<float><<<(r.numel() + 255) / 256, 256, 0, stream>>>(
+            w.data_ptr<float>(), decay.data_ptr<float>(), r.numel());
+        // Two value rows per warp reuse each prefetched vector. Larger head
+        // batches need fewer prefetched tokens to keep enough CTAs resident.
+#define WKV_REGISTER(P) forward_register_kernel<float, false, 2, P><<<dim3(B * H, 8), 128, 0, stream>>>( \
+            r.data_ptr<float>(), w.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(), \
+            a.data_ptr<float>(), b.data_ptr<float>(), initial.data_ptr<float>(), mask.data_ptr<bool>(), \
+            y.data_ptr<float>(), final.data_ptr<float>(), nullptr, decay.data_ptr<float>(), T, H, chunk, count)
+        if (B * H < 64) { WKV_REGISTER(8); } else { WKV_REGISTER(4); }
+#undef WKV_REGISTER
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return {y, final, cp};
+    }
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, r.scalar_type(), "wkv_forward", [&] {
         if (T > 1)
             prepare_decay<scalar_t><<<(r.numel() + 255) / 256, 256, 0, stream>>>(
                 w.data_ptr<scalar_t>(), decay.data_ptr<float>(), r.numel());
         const float *decay_ptr = T > 1 ? decay.data_ptr<float>() : nullptr;
-        if ((B * H >= 64 && T >= 8) || (T == 1 && B * H >= 512)) {
+        // One 64-thread tile per head underfills SM89 at B*H=64. The warp
+        // schedule preserves its reduction tree and supplies sixteen CTAs per
+        // head; reserve the shared-vector tile for larger head batches.
+        if ((B * H >= 128 && T >= 8) || (T == 1 && B * H >= 512)) {
             if (save) {
                 if (T == 1)
                     forward_tile_kernel<scalar_t, true, true><<<dim3(B * H, 1), 64, 0, stream>>>(
@@ -436,25 +597,35 @@ std::vector<Tensor> wkv_backward(Tensor r, Tensor w, Tensor k, Tensor v, Tensor 
     auto replay = at::empty({B, H, chunk, D, D}, cp.options());
     auto decay = at::empty(r.sizes(), cp.options());
     auto stream = c10::cuda::getCurrentCUDAStream();
+    if (r.scalar_type() == at::kFloat && B * H < 128) {
+        prepare_split_backward<<<(r.numel() + 255) / 256, 256, 0, stream>>>(
+            w.data_ptr<float>(), decay.data_ptr<float>(), dr.data_ptr<float>(), dw.data_ptr<float>(),
+            dk.data_ptr<float>(), da.data_ptr<float>(), db.data_ptr<float>(), r.numel());
+        backward_persistent<float, 32><<<dim3(B * H, 2), 256, 0, stream>>>(
+            r.data_ptr<float>(), w.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+            a.data_ptr<float>(), b.data_ptr<float>(), mask.data_ptr<bool>(), replay.data_ptr<float>(),
+            dy.data_ptr<float>(), ds.data_ptr<float>(), dr.data_ptr<float>(), dw.data_ptr<float>(),
+            dk.data_ptr<float>(), dv.data_ptr<float>(), da.data_ptr<float>(), db.data_ptr<float>(),
+            T, H, chunk, count, cp.data_ptr<float>(), decay.data_ptr<float>(),
+            final_grad.numel() ? final_grad.data_ptr<float>() : nullptr);
+        finish_split_dw<<<(r.numel() + 255) / 256, 256, 0, stream>>>(
+            w.data_ptr<float>(), decay.data_ptr<float>(), mask.data_ptr<bool>(),
+            dw.data_ptr<float>(), r.numel(), H * D);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return {dr, dw, dk, dv, da, db, ds};
+    }
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, r.scalar_type(), "wkv_backward", [&] {
         prepare_decay<scalar_t><<<(r.numel() + 255) / 256, 256, 0, stream>>>(
             w.data_ptr<scalar_t>(), decay.data_ptr<float>(), r.numel());
-        for (int c = count - 1; c >= 0; --c) {
-            int start = c * chunk, stop = std::min(T, int((c + 1) * chunk));
-            replay_parallel<scalar_t><<<dim3(B * H, 4), 128, 0, stream>>>(
-                decay.data_ptr<float>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-                a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), cp.data_ptr<float>(),
-                mask.data_ptr<bool>(), replay.data_ptr<float>(), T, H, chunk, count, c);
-            backward_parallel<scalar_t><<<B * H, 512, 0, stream>>>(
+            backward_persistent<scalar_t><<<B * H, 512, 0, stream>>>(
                 r.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(),
                 v.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(),
                 mask.data_ptr<bool>(), replay.data_ptr<float>(), dy.data_ptr<scalar_t>(),
                 ds.data_ptr<float>(), dr.data_ptr<scalar_t>(), dw.data_ptr<scalar_t>(),
                 dk.data_ptr<scalar_t>(), dv.data_ptr<scalar_t>(), da.data_ptr<scalar_t>(),
-                db.data_ptr<scalar_t>(), T, H, chunk, start, stop,
-                c == count - 1 ? (final_grad.numel() ? final_grad.data_ptr<float>() : nullptr)
-                               : ds.data_ptr<float>());
-        }
+                db.data_ptr<scalar_t>(), T, H, chunk, count,
+                cp.data_ptr<float>(), decay.data_ptr<float>(),
+                final_grad.numel() ? final_grad.data_ptr<float>() : nullptr);
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {dr, dw, dk, dv, da, db, ds};

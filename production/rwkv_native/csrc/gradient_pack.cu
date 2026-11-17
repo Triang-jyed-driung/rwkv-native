@@ -1,3 +1,4 @@
+// Retain high and first correction for FP16/BF16 adjoints.
 // Low-precision GEMM operands only; activation gradients remain FP32.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -33,7 +34,7 @@ __global__ void partial_max(const float *g, float *partial, int64_t size) {
         partial[blockIdx.x] = value;
 }
 template <bool ABSOLUTE, int BOUND = 0>
-__global__ void make_scale(const float *partial, float *scale, float *coefficients, int count) {
+__global__ void make_scale(const float *partial, float *scale, float *coefficients, int count, bool add) {
     float value = 0.f;
 #pragma unroll
     for (int i = threadIdx.x; i < (BOUND ? BOUND : count); i += THREADS)
@@ -49,7 +50,7 @@ __global__ void make_scale(const float *partial, float *scale, float *coefficien
         const int shift = max(-120, min(120, 7 - exponent));
         scale[0] = __uint_as_float(unsigned(127 + shift) << 23);
         coefficients[0] = __uint_as_float(unsigned(127 - shift) << 23);
-        coefficients[1] = 0.f;
+        coefficients[1] = add ? 1.f : 0.f;
     }
 }
 // Block zero reduces and packs small gradients while the other blocks copy x.
@@ -57,7 +58,7 @@ __global__ void make_scale(const float *partial, float *scale, float *coefficien
 template <class scalar_t, int PARTS, int BOUND>
 __global__ void small_pack(const float *g, const scalar_t *x, float *scale, float *coefficients,
                            scalar_t *packed, scalar_t *repeated, int64_t ng, int64_t nx,
-                           bool vector_x) {
+                           bool vector_x, bool add) {
     if (blockIdx.x) {
         if (vector_x) {
             for (int64_t i = int64_t(blockIdx.x - 1) * THREADS + threadIdx.x; i < nx / 8;
@@ -95,7 +96,7 @@ __global__ void small_pack(const float *g, const scalar_t *x, float *scale, floa
         factor = __uint_as_float(unsigned(127 + shift) << 23);
         scale[0] = factor;
         coefficients[0] = __uint_as_float(unsigned(127 - shift) << 23);
-        coefficients[1] = 0.f;
+        coefficients[1] = add ? 1.f : 0.f;
     }
     __syncthreads();
 #pragma unroll
@@ -156,7 +157,7 @@ __global__ void combine_parts(const float *products, const float *scale, float *
     }
 }
 } // namespace
-std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
+std::vector<Tensor> pack_impl(Tensor x, Tensor g, bool need_dw, bool add) {
     TORCH_CHECK(x.is_cuda() && g.device() == x.device() && x.dim() == 2 && g.dim() == 2 &&
                     x.size(0) == g.size(0),
                 "expected matching CUDA matrices");
@@ -166,7 +167,7 @@ std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
     TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
                 "expected FP16/BF16 operands");
     c10::cuda::CUDAGuard guard(x.device());
-    int parts = x.scalar_type() == at::kHalf ? 2 : 3;
+    constexpr int parts = 2;
     int blocks = std::min<int64_t>(1024, (g.numel() + THREADS - 1) / THREADS);
     auto partial = at::empty({blocks}, g.options()), scale = at::empty({}, g.options()),
          coefficients = at::empty({2}, g.options());
@@ -182,8 +183,8 @@ std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
     small_pack<TYPE, PARTS, BOUND><<<1 + copy_blocks, THREADS, 0, stream>>>(                       \
         g.data_ptr<float>(), x.data_ptr<TYPE>(), scale.data_ptr<float>(),                          \
         coefficients.data_ptr<float>(), packed.data_ptr<TYPE>(), repeated.data_ptr<TYPE>(),        \
-        g.numel(), nx, vector_x)
-        if (parts == 2) {
+        g.numel(), nx, vector_x, add)
+        if (x.scalar_type() == at::kHalf) {
             if (g.numel() <= 4096) {
                 SMALL(at::Half, 2, 4096);
             } else if (g.numel() <= 8192) {
@@ -193,11 +194,11 @@ std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
             }
         } else {
             if (g.numel() <= 4096) {
-                SMALL(at::BFloat16, 3, 4096);
+                SMALL(at::BFloat16, 2, 4096);
             } else if (g.numel() <= 8192) {
-                SMALL(at::BFloat16, 3, 8192);
+                SMALL(at::BFloat16, 2, 8192);
             } else {
-                SMALL(at::BFloat16, 3, 16384);
+                SMALL(at::BFloat16, 2, 16384);
             }
         }
 #undef SMALL
@@ -206,16 +207,16 @@ std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
                                                     g.numel());
         make_scale<false><<<1, THREADS, 0, stream>>>(partial.data_ptr<float>(),
                                                      scale.data_ptr<float>(),
-                                                     coefficients.data_ptr<float>(), blocks);
+                                                     coefficients.data_ptr<float>(), blocks, add);
         blocks = std::min<int64_t>(
             4096, (std::max(g.numel(), vector_x ? nx / 8 : nx) + THREADS - 1) / THREADS);
-        if (parts == 2)
+        if (x.scalar_type() == at::kHalf)
             pack_operands<at::Half, 2><<<blocks, THREADS, 0, stream>>>(
                 g.data_ptr<float>(), x.data_ptr<at::Half>(), scale.data_ptr<float>(),
                 packed.data_ptr<at::Half>(), repeated.data_ptr<at::Half>(), g.numel(), nx,
                 vector_x);
         else
-            pack_operands<at::BFloat16, 3><<<blocks, THREADS, 0, stream>>>(
+            pack_operands<at::BFloat16, 2><<<blocks, THREADS, 0, stream>>>(
                 g.data_ptr<float>(), x.data_ptr<at::BFloat16>(), scale.data_ptr<float>(),
                 packed.data_ptr<at::BFloat16>(), repeated.data_ptr<at::BFloat16>(), g.numel(), nx,
                 vector_x);
@@ -223,7 +224,13 @@ std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {packed, repeated, coefficients, scale};
 }
-Tensor combine(Tensor products, Tensor scale, int64_t parts) {
+std::vector<Tensor> pack(Tensor x, Tensor g, bool need_dw) {
+    return pack_impl(x,g,need_dw,false);
+}
+std::vector<Tensor> pack_accumulating(Tensor x, Tensor g, bool add) {
+    return pack_impl(x,g,true,add);
+}
+Tensor combine_into(Tensor products, Tensor scale, int64_t parts, Tensor out) {
     TORCH_CHECK(products.is_cuda() && products.dim() == 2 && products.scalar_type() == at::kFloat &&
                     products.is_contiguous(),
                 "expected contiguous FP32 products");
@@ -233,7 +240,11 @@ Tensor combine(Tensor products, Tensor scale, int64_t parts) {
                     scale.numel() == 1 && scale.is_contiguous(),
                 "invalid scale");
     c10::cuda::CUDAGuard guard(products.device());
-    auto out = at::empty({products.size(0) / parts, products.size(1)}, products.options());
+    if (!out.defined())
+        out = at::empty({products.size(0) / parts, products.size(1)}, products.options());
+    TORCH_CHECK(out.device()==products.device() && out.scalar_type()==at::kFloat && out.is_contiguous()
+                && out.sizes()==at::IntArrayRef({products.size(0)/parts,products.size(1)}),
+                "invalid FP32 output slice");
     if (out.numel()) {
         int blocks = std::min<int64_t>(4096, (out.numel() + THREADS - 1) / THREADS);
         auto stream = c10::cuda::getCurrentCUDAStream();
@@ -249,7 +260,12 @@ Tensor combine(Tensor products, Tensor scale, int64_t parts) {
     }
     return out;
 }
+Tensor combine(Tensor products, Tensor scale, int64_t parts) {
+    return combine_into(products,scale,parts,Tensor());
+}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pack", &pack);
+    m.def("pack_accumulating", &pack_accumulating);
     m.def("combine", &combine);
+    m.def("combine_into", &combine_into);
 }

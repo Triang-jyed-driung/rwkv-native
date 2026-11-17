@@ -7,6 +7,7 @@ from .._extensions import extension
 from .adjoints import projection_backward
 from .gemm import project_rows
 from .normalization import norm_shift_backward
+from .decode import input_projections
 
 # R,K,V,W1,A1,G1,(V1) select branches of the checkpoint's R,W,K,V,A,G mixes.
 PROJECTION_BRANCHES = (0, 2, 3, 1, 4, 5, 3)
@@ -34,7 +35,11 @@ class _AttentionProjections(torch.autograd.Function):
             for branch in PROJECTION_BRANCHES[: len(weights)]
         ]
         expected_widths = (2048, 2048, 2048, 96, 96, 256, 64)[: len(weights)]
-        if (
+        if (not save and x.shape[:2] == (1,1) and x.shape[2] in (2560,4096)
+                and all(w.shape[1] % 8 == 0 for w in weights)
+                and all(b in ('fixed','lt','lt_equivalent') for b in backends)):
+            outputs=input_projections(operands,weights,backends)
+        elif (
             all(backend == "pre_group" for backend in backends)
             and tuple(weight.shape[1] for weight in weights) == expected_widths
         ):

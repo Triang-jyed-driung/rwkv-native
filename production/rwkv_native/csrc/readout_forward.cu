@@ -15,8 +15,8 @@ __device__ float readout_sum(float x) {
         x += __shfl_down_sync(0xffffffff, x, d);
     return __shfl_sync(0xffffffff, x, 0);
 }
-template <typename P>
-__global__ __launch_bounds__(32, 2) void readout_rows(ReadoutInput<P> a, float *out, int H) {
+template <typename P, typename O>
+__global__ __launch_bounds__(32, 2) void readout_rows(ReadoutInput<P> a, O *out, int H) {
     const int group = blockIdx.x, head = group % H, lane = threadIdx.x;
     float x[2], dot = 0.f, sum = 0.f;
 #pragma unroll
@@ -43,7 +43,7 @@ __global__ __launch_bounds__(32, 2) void readout_rows(ReadoutInput<P> a, float *
                  a.x[7][i];
     }
 }
-Tensor readout_forward(std::vector<Tensor> xs, int64_t H) {
+Tensor readout_forward_impl(std::vector<Tensor> xs, int64_t H, bool packed) {
     TORCH_CHECK(xs.size() == 8, "expected x,r,k,v,scale,weight,bias,gate");
     const auto x = xs[0];
     TORCH_CHECK(x.dim() >= 2 && H > 0 && x.size(-1) == H * 64, "expected 64-wide heads");
@@ -63,7 +63,7 @@ Tensor readout_forward(std::vector<Tensor> xs, int64_t H) {
         }
     }
     c10::cuda::CUDAGuard guard(x.device());
-    auto out = at::empty_like(x);
+    auto out = at::empty_like(x, x.options().dtype(packed ? dtype : at::kFloat));
     if (x.numel()) {
         AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, dtype, "readout_forward", [&] {
             ReadoutInput<scalar_t> args{};
@@ -73,10 +73,22 @@ Tensor readout_forward(std::vector<Tensor> xs, int64_t H) {
                 else
                     args.x[i] = xs[i].data_ptr<float>();
             }
-            readout_rows<scalar_t><<<x.numel() / 64, 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
-                args, out.data_ptr<float>(), H);
+            if (packed)
+                readout_rows<scalar_t, scalar_t><<<x.numel() / 64, 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
+                    args, out.data_ptr<scalar_t>(), H);
+            else
+                readout_rows<scalar_t, float><<<x.numel() / 64, 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
+                    args, out.data_ptr<float>(), H);
         });
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+Tensor readout_forward(std::vector<Tensor> xs, int64_t H) {
+    return readout_forward_impl(xs, H, false);
+}
+
+Tensor readout_packed_forward(std::vector<Tensor> xs, int64_t H) {
+    return readout_forward_impl(xs, H, true);
 }

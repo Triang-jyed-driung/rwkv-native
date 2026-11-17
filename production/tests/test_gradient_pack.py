@@ -11,8 +11,6 @@ def reference(x, g, need_dw):
     high = scaled.to(x.dtype)
     low = (scaled - high.float()).to(x.dtype)
     parts = [high, low]
-    if x.dtype == torch.bfloat16:
-        parts.append((scaled - high.float() - low.float()).to(x.dtype))
     return (
         torch.cat(parts, 0),
         torch.cat([x] * len(parts), 0) if need_dw else x.new_empty((0, x.shape[1])),

@@ -7,6 +7,7 @@ from .._extensions import extension
 from .adjoints import projection_backward
 from .gemm import project_rows
 from .normalization import norm_shift_backward
+from .decode import ffn_up
 
 
 class _ChannelFrontend(torch.autograd.Function):
@@ -25,14 +26,30 @@ class _ChannelFrontend(torch.autograd.Function):
         save,
         mode,
         backends,
+        packed_relu,
     ):
         output_backend, key_backend = backends
         attention_operand = mixed.reshape(-1, mixed.shape[-1]).to(output_weight.dtype).contiguous()
         attention_output = project_rows(attention_operand, output_weight, output_backend)
-        packed, normalized, state, residual = extension("frontend").run(
+        frontend = "frontend_prefill" if not save and x.shape[1] > 1 and x.shape[2] in (2560,4096) else "frontend"
+        packed, normalized, state, residual = extension(frontend).run(
             [x, attention_output, previous, norm_weight, norm_bias, mix_coefficient], mask, save
         )
-        key = project_rows(packed, key_weight, key_backend).view(*x.shape[:2], key_weight.shape[1])
+        # Ordinary BF16 short prefill may reuse the faster ordered up GEMM.
+        # Keep training and the already-fast <=256-row cuBLAS route unchanged.
+        if (not save and key_backend == "torch" and packed.dtype == torch.bfloat16
+                and tuple(key_weight.shape) == (4096, 16384)
+                and 256 < packed.shape[0] <= 320):
+            key_backend = "fixed"
+        if packed_relu and not save and packed.shape[0] == 1 and x.shape[-1] in (2560,4096):
+            key=ffn_up(packed,key_weight,key_backend)
+        elif packed_relu:
+            key = extension("flash_linear").run(
+                packed,key_weight.T,132 if packed.shape[0] >= 2048 else 128,True
+            )
+        else:
+            key = project_rows(packed, key_weight, key_backend)
+        key = key.view(*x.shape[:2],key_weight.shape[1])
         if save:
             ctx.save_for_backward(
                 attention_operand,
@@ -103,6 +120,7 @@ class _ChannelFrontend(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -118,6 +136,8 @@ def channel_frontend(
     mask,
     mode,
     backends,
+    *,
+    packed_relu=False,
 ):
     inputs = [
         x.contiguous(),
@@ -130,4 +150,6 @@ def channel_frontend(
         key_weight,
     ]
     save = torch.is_grad_enabled() and any(value.requires_grad for value in inputs)
-    return _ChannelFrontend.apply(*inputs, mask.contiguous(), save, mode, backends)
+    if packed_relu and torch.is_grad_enabled():
+        raise ValueError("packed ReLU key is an inference-only fusion")
+    return _ChannelFrontend.apply(*inputs, mask.contiguous(), save, mode, backends, packed_relu)
